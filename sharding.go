@@ -897,11 +897,11 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 								colName := extractColumnName(argColRef.ColumnRef, aliasMap)
 								fmt.Println("Checking LEFT for sharding key in LOWER function:", colName, getColumnNameWithoutTable(colName))
 								if getColumnNameWithoutTable(colName) == shardingKey {
-									fmt.Println("Checking LEFT for sharding1 key in LOWER function:", colName)
+									//fmt.Println("Checking LEFT for sharding1 key in LOWER function:", colName)
 									// Found sharding key in LOWER function, extract value from right side
 									rightVal, err := extractValueFromExpr(n.AExpr.Rexpr, args)
 									if err == nil && rightVal != nil {
-										fmt.Println("Found LEFT sharding key in LOWER function, value:", rightVal)
+										//fmt.Println("Found LEFT sharding key in LOWER function, value:", rightVal)
 										return true, rightVal, nil
 									}
 								}
@@ -918,13 +918,13 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 							// Extract the column from LOWER(column)
 							if argColRef, ok := funcCall.FuncCall.Args[0].Node.(*pg_query.Node_ColumnRef); ok {
 								colName := extractColumnName(argColRef.ColumnRef, aliasMap)
-								fmt.Println("Checking RIGHT for sharding key in LOWER function:", colName)
+								//fmt.Println("Checking RIGHT for sharding key in LOWER function:", colName)
 								if getColumnNameWithoutTable(colName) == shardingKey {
-									fmt.Println("Found RIGHT sharding key in LOWER function, value:", colName)
+									//fmt.Println("Found RIGHT sharding key in LOWER function, value:", colName)
 									// Found sharding key in LOWER function, extract value from left side
 									leftVal, err := extractValueFromExpr(n.AExpr.Lexpr, args)
 									if err == nil && leftVal != nil {
-										fmt.Println("Found RIGHT sharding key in LOWER function, value:", leftVal)
+										//fmt.Println("Found RIGHT sharding key in LOWER function, value:", leftVal)
 										return true, leftVal, nil
 									}
 								}
