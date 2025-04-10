@@ -195,7 +195,7 @@ func NameShardingConfig(numberOfShards uint) Config {
 		ShardingKey:    "name",
 		NumberOfShards: numberOfShards,
 		ShardingAlgorithm: func(columnValue any) (suffix string, err error) {
-			fmt.Println("columnValue: ", columnValue)
+			//fmt.Println("columnValue: ", columnValue)
 			str, ok := columnValue.(string)
 			if !ok {
 				return "", fmt.Errorf("expected string, got %T", columnValue)
@@ -216,7 +216,7 @@ func NameShardingConfig(numberOfShards uint) Config {
 
 			// Use modulo to determine the shard
 			suffix = fmt.Sprintf("_%d", hashValue%uint32(numberOfShards))
-			fmt.Println("suffix: ", suffix)
+			//fmt.Println("suffix: ", suffix)
 			return suffix, nil
 		},
 	}

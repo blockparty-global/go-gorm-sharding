@@ -11,9 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"gorm.io/gorm"
-
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"gorm.io/gorm"
 )
 
 // GlobalIndexOptions configures how the global index operates
