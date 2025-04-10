@@ -650,13 +650,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 					// If more than one unique suffix is found, return an error
 					if len(suffixes) > 1 {
-						// Don't error immediately, let the batch handler deal with it
-						// Set tableName so the caller knows this needs batch processing
-						// rather than returning ErrInsertDiffSuffix
+						// Return ErrInsertDiffSuffix to signal different sharding keys detected
 						tableName = originalTableName
-
-						// Return the original query to let batch handler process it
-						return query, query, tableName, nil
+						return query, query, tableName, ErrInsertDiffSuffix
 					}
 
 					// Capture the consistent suffix
@@ -684,13 +680,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 					// If more than one unique suffix is found, return an error
 					if len(suffixes) > 1 {
-						// Don't error immediately, let the batch handler deal with it
-						// Set tableName so the caller knows this needs batch processing
-						// rather than returning ErrInsertDiffSuffix
+						// Return ErrInsertDiffSuffix to signal different sharding keys detected
 						tableName = originalTableName
-
-						// Return the original query to let batch handler process it
-						return query, query, tableName, nil
+						return query, query, tableName, ErrInsertDiffSuffix
 					}
 
 					// Capture the consistent suffix
@@ -702,13 +694,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			if len(suffixes) == 1 {
 				suffix = consistentSuffix
 			} else {
-				// Don't error immediately, let the batch handler deal with it
-				// Set tableName so the caller knows this needs batch processing
-				// rather than returning ErrInsertDiffSuffix
+				// Return ErrInsertDiffSuffix to signal different sharding keys detected
 				tableName = originalTableName
-
-				// Return the original query to let batch handler process it
-				return query, query, tableName, nil
+				return query, query, tableName, ErrInsertDiffSuffix
 			}
 
 			shardedTableName := originalTableName + suffix
@@ -926,13 +914,13 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 							// Extract the column from LOWER(column)
 							if argColRef, ok := funcCall.FuncCall.Args[0].Node.(*pg_query.Node_ColumnRef); ok {
 								colName := extractColumnName(argColRef.ColumnRef, aliasMap)
-								fmt.Println("Checking LEFT for sharding key in LOWER function:", colName, getColumnNameWithoutTable(colName))
+								GetLogger().Debug("Checking LEFT for sharding key in LOWER function: %s %s", colName, getColumnNameWithoutTable(colName))
 								if getColumnNameWithoutTable(colName) == shardingKey {
-									fmt.Println("Checking LEFT for sharding1 key in LOWER function:", colName)
+									GetLogger().Debug("Checking LEFT for sharding1 key in LOWER function: %s", colName)
 									// Found sharding key in LOWER function, extract value from right side
 									rightVal, err := extractValueFromExpr(n.AExpr.Rexpr, args)
 									if err == nil && rightVal != nil {
-										fmt.Println("Found LEFT sharding key in LOWER function, value:", rightVal)
+										GetLogger().Debug("Found sharding key %s in LOWER function: value=%v", shardingKey, rightVal)
 										return true, rightVal, nil
 									}
 								}
@@ -949,13 +937,13 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 							// Extract the column from LOWER(column)
 							if argColRef, ok := funcCall.FuncCall.Args[0].Node.(*pg_query.Node_ColumnRef); ok {
 								colName := extractColumnName(argColRef.ColumnRef, aliasMap)
-								fmt.Println("Checking RIGHT for sharding key in LOWER function:", colName)
+								GetLogger().Debug("Checking RIGHT for sharding key in LOWER function: %s", colName)
 								if getColumnNameWithoutTable(colName) == shardingKey {
-									fmt.Println("Found RIGHT sharding key in LOWER function, value:", colName)
+									GetLogger().Debug("Found RIGHT sharding key in LOWER function: value=%s", colName)
 									// Found sharding key in LOWER function, extract value from left side
 									leftVal, err := extractValueFromExpr(n.AExpr.Lexpr, args)
 									if err == nil && leftVal != nil {
-										fmt.Println("Found RIGHT sharding key in LOWER function, value:", leftVal)
+										GetLogger().Debug("Found sharding key %s in LOWER function: value=%v", shardingKey, leftVal)
 										return true, leftVal, nil
 									}
 								}
