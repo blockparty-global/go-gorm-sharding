@@ -36,12 +36,8 @@ type ContractWithHashPartition struct {
 	UpdatedAt time.Time
 }
 
-func TestHashPartitioningWithLowerFunctionFixed(t *testing.T) {
-	// Skip the test if running in short mode
-	if testing.Short() {
-		t.Skip("Skipping test in short mode")
-	}
-	
+func TestHashPartitioningWithLowerFunction(t *testing.T) {
+
 	// Create a test DB with proper configuration
 	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
 		DisableForeignKeyConstraintWhenMigrating: true,
@@ -50,7 +46,7 @@ func TestHashPartitioningWithLowerFunctionFixed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to connect to database: %v", err)
 	}
-	
+
 	// Register cleanup function
 	t.Cleanup(func() {
 		// Drop tables after test completion
@@ -304,18 +300,18 @@ func TestHashPartitioningWithLowerFunctionFixed(t *testing.T) {
 			Find(&mtkContracts).Error
 		tassert.NoError(t, err, "Query for contracts should succeed")
 		tassert.GreaterOrEqual(t, len(mtkContracts), 1, "Should find at least one MTKN contract")
-		
+
 		// Query tokens for one specific contract
 		if len(mtkContracts) > 0 {
 			var contractTokens []TokenWithHashPartition
 			err := testDB.Where("contract = ?", mtkContracts[0].Address).Find(&contractTokens).Error
 			tassert.NoError(t, err, "Query for tokens should succeed")
-			
+
 			t.Logf("Found %d tokens for contract %s (%s)", len(contractTokens), mtkContracts[0].Address, mtkContracts[0].Name)
 			tassert.Equal(t, 3, len(contractTokens), "Should find exactly 3 tokens for the contract")
 		}
 	})
-	
+
 	// This is a no-op test to make sure the package is tested correctly
 	t.Run("NoOp", func(t *testing.T) {
 		tassert.True(t, true, "This test should always pass")
