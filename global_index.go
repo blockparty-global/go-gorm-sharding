@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"gorm.io/gorm"
 	"log"
 	"regexp"
 	"strconv"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
+	"gorm.io/gorm"
 )
 
 // GlobalIndexOptions configures how the global index operates

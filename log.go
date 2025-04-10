@@ -2,7 +2,6 @@ package sharding
 
 import (
 	"errors"
-	"log"
 )
 
 type LogLevel int
@@ -20,23 +19,17 @@ var (
 )
 
 func debugLog(format string, args ...interface{}) {
-	if DefaultLogLevel >= LogLevelDebug {
-		log.Printf(format, args...)
-	}
+	GetLogger().Debug(format, args...)
 }
 
 func traceLog(format string, args ...interface{}) {
-	if DefaultLogLevel >= LogLevelTrace {
-		log.Printf(format, args...)
-	}
+	GetLogger().Trace(format, args...)
 }
 
 func infoLog(format string, args ...interface{}) {
-	if DefaultLogLevel >= LogLevelInfo {
-		log.Printf(format, args...)
-	}
+	GetLogger().Info(format, args...)
 }
 
 func errorLog(format string, args ...interface{}) {
-	log.Printf(format, args...)
+	GetLogger().Error(format, args...)
 }

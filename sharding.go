@@ -136,6 +136,11 @@ type Config struct {
 }
 
 func Register(config interface{}, tables ...interface{}) *Sharding {
+	// Load configuration from file
+	if err := LoadConfigFromFile(""); err != nil {
+		GetLogger().Info("Failed to load configuration: %v", err)
+	}
+
 	s := &Sharding{
 		_tables: tables,
 	}
@@ -359,6 +364,16 @@ func (s *Sharding) registerCallbacks(db *gorm.DB) {
 	s.Callback().Delete().Before("*").Register("gorm:sharding", s.switchConn)
 	s.Callback().Row().Before("*").Register("gorm:sharding", s.switchConn)
 	s.Callback().Raw().Before("*").Register("gorm:sharding", s.switchConn)
+
+	// Add a new callback before gorm:create to handle multi-shard inserts
+	db.Callback().Create().Before("gorm:create").Register("sharding:handle_multi_shard", func(db *gorm.DB) {
+		if db.Error == nil {
+			err := s.handleMultiShardInsert(db)
+			if err != nil {
+				db.Error = err
+			}
+		}
+	})
 }
 
 func (s *Sharding) switchConn(db *gorm.DB) {
@@ -635,8 +650,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 					// If more than one unique suffix is found, return an error
 					if len(suffixes) > 1 {
-						// Even with DoubleWrite, we can't insert into different shards in one query
-						return ftQuery, stQuery, tableName, ErrInsertDiffSuffix
+						// Return ErrInsertDiffSuffix to signal different sharding keys detected
+						tableName = originalTableName
+						return query, query, tableName, ErrInsertDiffSuffix
 					}
 
 					// Capture the consistent suffix
@@ -664,8 +680,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 					// If more than one unique suffix is found, return an error
 					if len(suffixes) > 1 {
-						// Even with DoubleWrite, we can't insert into different shards in one query
-						return ftQuery, stQuery, tableName, ErrInsertDiffSuffix
+						// Return ErrInsertDiffSuffix to signal different sharding keys detected
+						tableName = originalTableName
+						return query, query, tableName, ErrInsertDiffSuffix
 					}
 
 					// Capture the consistent suffix
@@ -677,7 +694,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			if len(suffixes) == 1 {
 				suffix = consistentSuffix
 			} else {
-				return ftQuery, stQuery, tableName, ErrInsertDiffSuffix
+				// Return ErrInsertDiffSuffix to signal different sharding keys detected
+				tableName = originalTableName
+				return query, query, tableName, ErrInsertDiffSuffix
 			}
 
 			shardedTableName := originalTableName + suffix
@@ -717,16 +736,16 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 					if ok {
 						shardingKey := cfg.ShardingKey
 						value, id, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, aliasMap, table)
-						//log.Printf("For table %s: keyFound=%v, value=%v, id=%v, err=%v", table, keyFound, value, id, err)
+						//GetLogger().Debug("For table %s: keyFound=%v, value=%v, id=%v, err=%v", table, keyFound, value, id, err)
 
 						// Log when suffix is determined
 						if keyFound || (id != 0) {
 							suffix, err := getSuffix(value, id, keyFound, cfg)
-							log.Printf("For table %s: suffix=%s, err=%v", table, suffix, err)
+							GetLogger().Debug("For table %s: suffix=%s, err=%v", table, suffix, err)
 
 							// Log the updating of tableMap
 							shardedTableName := table + suffix
-							log.Printf("Adding to tableMap: %s -> %s", table, shardedTableName)
+							GetLogger().Debug("Adding to tableMap: %s -> %s", table, shardedTableName)
 
 							// Thread-safely update the tableMap
 							tableMapMutex.Lock()
@@ -734,12 +753,12 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 							tableMapMutex.Unlock()
 						}
 					} else {
-						log.Printf("No config found for table %s", table)
+						GetLogger().Debug("No config found for table %s", table)
 					}
 				}
 
 				// After building tableMap
-				log.Printf("Final tableMap for SELECT: %v", tableMap)
+				GetLogger().Debug("Final tableMap for SELECT: %v", tableMap)
 			}
 
 			// Extract sharding key for the current table
@@ -793,7 +812,7 @@ func (s *Sharding) extractShardingKeyFromConditions(shardingKey string, conditio
 			// If we find a LOWER function, try to extract the sharding key from it
 			keyFound, value, err = extractShardingKeyFromLowerFunction(shardingKey, condition, args, knownKeys, aliasMap)
 			if keyFound || err != nil {
-				log.Printf("Found sharding key %s in LOWER function: value=%v", shardingKey, value)
+				GetLogger().Debug("Found sharding key %s in LOWER function: value=%v", shardingKey, value)
 				return value, id, keyFound, err
 			}
 		}
@@ -810,7 +829,7 @@ func (s *Sharding) extractShardingKeyFromConditions(shardingKey string, conditio
 		// This handles ((col1, col2, ...)) IN ((val1, val2, ...)) pattern
 		keyFound, value, err = extractShardingKeyFromCompositeIn(shardingKey, condition, args, knownKeys)
 		if keyFound || err != nil {
-			log.Printf("Composite IN condition found for sharding key %s: value=%v, err=%v", shardingKey, value, err)
+			GetLogger().Debug("Composite IN condition found for sharding key %s: value=%v, err=%v", shardingKey, value, err)
 			return value, id, keyFound, err
 		}
 
@@ -853,7 +872,7 @@ func (s *Sharding) extractShardingKeyFromConditions(shardingKey string, conditio
 		}
 
 		for _, condition := range conditions {
-			//log.Println("Traversing condition for 'id'")
+			//GetLogger().Trace("Traversing condition for 'id'")
 			idFound, idValue, err = traverseConditionForKey("id", condition, args, knownKeys, aliasMap)
 			if idFound || err != nil {
 				break
@@ -895,10 +914,13 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 							// Extract the column from LOWER(column)
 							if argColRef, ok := funcCall.FuncCall.Args[0].Node.(*pg_query.Node_ColumnRef); ok {
 								colName := extractColumnName(argColRef.ColumnRef, aliasMap)
+								GetLogger().Debug("Checking LEFT for sharding key in LOWER function: %s %s", colName, getColumnNameWithoutTable(colName))
 								if getColumnNameWithoutTable(colName) == shardingKey {
+									GetLogger().Debug("Checking LEFT for sharding1 key in LOWER function: %s", colName)
 									// Found sharding key in LOWER function, extract value from right side
 									rightVal, err := extractValueFromExpr(n.AExpr.Rexpr, args)
 									if err == nil && rightVal != nil {
+										GetLogger().Debug("Found sharding key %s in LOWER function: value=%v", shardingKey, rightVal)
 										return true, rightVal, nil
 									}
 								}
@@ -915,10 +937,13 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 							// Extract the column from LOWER(column)
 							if argColRef, ok := funcCall.FuncCall.Args[0].Node.(*pg_query.Node_ColumnRef); ok {
 								colName := extractColumnName(argColRef.ColumnRef, aliasMap)
+								GetLogger().Debug("Checking RIGHT for sharding key in LOWER function: %s", colName)
 								if getColumnNameWithoutTable(colName) == shardingKey {
+									GetLogger().Debug("Found RIGHT sharding key in LOWER function: value=%s", colName)
 									// Found sharding key in LOWER function, extract value from left side
 									leftVal, err := extractValueFromExpr(n.AExpr.Lexpr, args)
 									if err == nil && leftVal != nil {
+										GetLogger().Debug("Found sharding key %s in LOWER function: value=%v", shardingKey, leftVal)
 										return true, leftVal, nil
 									}
 								}
@@ -990,33 +1015,33 @@ func extractShardingKeyFromCompositeIn(shardingKey string, node *pg_query.Node, 
 	case *pg_query.Node_AExpr:
 		if n.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_IN {
 			// This is an IN expression
-			log.Printf("Found IN expression")
+			GetLogger().Debug("Found IN expression")
 
 			// Check the left side (columns) of the IN expression
 			if row, ok := n.AExpr.Lexpr.Node.(*pg_query.Node_RowExpr); ok {
-				log.Printf("Found row expression with %d args", len(row.RowExpr.Args))
+				GetLogger().Debug("Found row expression with %d args", len(row.RowExpr.Args))
 
 				// Check each column in the composite key to see if it matches our sharding key
 				for colIndex, colNode := range row.RowExpr.Args {
 					if colRef, ok := colNode.Node.(*pg_query.Node_ColumnRef); ok {
 						colName := extractColumnName(colRef.ColumnRef, nil)
-						log.Printf("Column at position %d: %s", colIndex, colName)
+						GetLogger().Debug("Column at position %d: %s", colIndex, colName)
 
 						// If this column matches our sharding key, extract the value from the right side
 						if getColumnNameWithoutTable(colName) == shardingKey {
-							log.Printf("Found sharding key %s in composite IN at position %d", shardingKey, colIndex)
+							GetLogger().Debug("Found sharding key %s in composite IN at position %d", shardingKey, colIndex)
 
 							// Handle the right side based on its type
 							switch rexpr := n.AExpr.Rexpr.Node.(type) {
 							case *pg_query.Node_List:
 								// List of RowExprs or other values
-								log.Printf("Right side is a list with %d items", len(rexpr.List.Items))
+								GetLogger().Debug("Right side is a list with %d items", len(rexpr.List.Items))
 								if len(rexpr.List.Items) > 0 {
 									if firstRow, ok := rexpr.List.Items[0].Node.(*pg_query.Node_RowExpr); ok {
 										// Extract the value at the same position as our sharding key
 										if colIndex < len(firstRow.RowExpr.Args) {
 											valueNode := firstRow.RowExpr.Args[colIndex]
-											log.Printf("Extracting value from position %d", colIndex)
+											GetLogger().Debug("Extracting value from position %d", colIndex)
 											value, err := extractValueFromExpr(valueNode, args)
 											return true, value, err
 										}
@@ -1024,7 +1049,7 @@ func extractShardingKeyFromCompositeIn(shardingKey string, node *pg_query.Node, 
 								}
 							case *pg_query.Node_RowExpr:
 								// Single RowExpr
-								log.Printf("Right side is a row expression with %d items", len(rexpr.RowExpr.Args))
+								GetLogger().Debug("Right side is a row expression with %d items", len(rexpr.RowExpr.Args))
 								if colIndex < len(rexpr.RowExpr.Args) {
 									valueNode := rexpr.RowExpr.Args[colIndex]
 									value, err := extractValueFromExpr(valueNode, args)
@@ -1032,7 +1057,7 @@ func extractShardingKeyFromCompositeIn(shardingKey string, node *pg_query.Node, 
 								}
 							case *pg_query.Node_SubLink:
 								// Subquery - currently not supported
-								log.Printf("Right side is a subquery (not supported)")
+								GetLogger().Debug("Right side is a subquery (not supported)")
 								return false, nil, fmt.Errorf("subquery in composite IN not supported")
 							}
 						}
@@ -1267,7 +1292,7 @@ func (s *Sharding) extractInsertShardingKeyFromValues(r Config, insertStmt *pg_q
 			return nil, 0, false, err
 		}
 		if strings.EqualFold(colName, r.ShardingKey) {
-			log.Printf("Found sharding key '%s' with value: %v", colName, exprValue)
+			GetLogger().Debug("Found sharding key '%s' with value: %v", colName, exprValue)
 			value = exprValue
 			keyFound = true
 		}
@@ -1331,7 +1356,7 @@ func toInt64(value interface{}) (int64, error) {
 		return int64(v), nil
 	case uint64:
 		if v > math.MaxInt64 {
-			log.Printf("uint64 value %d overflows int64", v)
+			GetLogger().Error("uint64 value %d overflows int64", v)
 			return 0, fmt.Errorf("uint64 value %d overflows int64", v)
 		}
 		return int64(v), nil
@@ -1357,7 +1382,7 @@ func toInt64(value interface{}) (int64, error) {
 				}
 			}
 		}
-		log.Printf("Unsupported type for conversion to int64: %T\n", v)
+		GetLogger().Error("Unsupported type for conversion to int64: %T", v)
 		return 0, fmt.Errorf("unsupported type for conversion to int64: %T", v)
 	}
 }
@@ -1381,6 +1406,7 @@ func collectTablesFromSelect(selectStmt *pg_query.SelectStmt) []string {
 	return tables
 }
 
+// collectTablesFromJoin extracts table names from JOIN expressions
 func collectTablesFromJoin(joinExpr *pg_query.JoinExpr) []string {
 	var tables []string
 	if joinExpr.Larg != nil {
@@ -1430,7 +1456,7 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 	switch n := node.Node.(type) {
 	case *pg_query.Node_RangeVar:
 		if n.RangeVar.Schemaname != "" {
-			log.Printf("Skipping schema-qualified table: %s.%s", n.RangeVar.Schemaname, n.RangeVar.Relname)
+			GetLogger().Debug("Skipping schema-qualified table: %s.%s", n.RangeVar.Schemaname, n.RangeVar.Relname)
 
 			// Do not replace schema-qualified table names
 			return
@@ -1443,7 +1469,7 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 
 	case *pg_query.Node_UpdateStmt:
 		if newName, ok := tableMap[n.UpdateStmt.Relation.Relname]; ok {
-			//log.Printf("Replacing table name '%s' with sharded name '%s' in UpdateStmt\n", n.UpdateStmt.Relation.Relname, newName)
+			//GetLogger().Debug("Replacing table name '%s' with sharded name '%s' in UpdateStmt", n.UpdateStmt.Relation.Relname, newName)
 			n.UpdateStmt.Relation.Relname = newName
 			n.UpdateStmt.Relation.Location = -1 // Force quoting
 		}
@@ -1453,7 +1479,7 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 		}
 	case *pg_query.Node_DeleteStmt:
 		if newName, ok := tableMap[n.DeleteStmt.Relation.Relname]; ok {
-			//log.Printf("Replacing table name '%s' with sharded name '%s' in DeleteStmt\n", n.DeleteStmt.Relation.Relname, newName)
+			//GetLogger().Debug("Replacing table name '%s' with sharded name '%s' in DeleteStmt", n.DeleteStmt.Relation.Relname, newName)
 			n.DeleteStmt.Relation.Relname = newName
 			n.DeleteStmt.Relation.Location = -1 // Force quoting
 		}
@@ -1487,7 +1513,7 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 				originalTableName := stringNode.String_.Sval
 				if newTableName, exists := tableMap[originalTableName]; exists {
 					// Replace the table name with the sharded name
-					//log.Printf("Replacing table name '%s' with sharded name '%s' in ColumnRef\n", originalTableName, newTableName)
+					//GetLogger().Debug("Replacing table name '%s' with sharded name '%s' in ColumnRef", originalTableName, newTableName)
 					stringNode.String_.Sval = newTableName
 				}
 			}
@@ -1715,7 +1741,7 @@ func traverseConditionForKey(shardingKey string, node *pg_query.Node, args []int
 							if argColRef, ok := funcCall.FuncCall.Args[0].Node.(*pg_query.Node_ColumnRef); ok {
 								leftColName = extractColumnName(argColRef.ColumnRef, aliasMap)
 								leftIsCol = true
-								log.Printf("Detected LOWER function on column: %s", leftColName)
+								GetLogger().Debug("Detected LOWER function on column: %s", leftColName)
 
 								// Check if this is the sharding key directly
 								if getColumnNameWithoutTable(leftColName) == shardingKey {
@@ -1744,7 +1770,7 @@ func traverseConditionForKey(shardingKey string, node *pg_query.Node, args []int
 							if argColRef, ok := funcCall.FuncCall.Args[0].Node.(*pg_query.Node_ColumnRef); ok {
 								rightColName = extractColumnName(argColRef.ColumnRef, aliasMap)
 								rightIsCol = true
-								log.Printf("Detected LOWER function on column: %s", rightColName)
+								GetLogger().Debug("Detected LOWER function on column: %s", rightColName)
 
 								// Check if this is the sharding key directly
 								if getColumnNameWithoutTable(rightColName) == shardingKey {
@@ -1941,7 +1967,6 @@ func traverseConditionForKey(shardingKey string, node *pg_query.Node, args []int
 				}
 			}
 		}
-
 	}
 	return false, nil, nil
 }
@@ -2035,27 +2060,27 @@ func getSuffix(value any, id int64, keyFound bool, r Config) (suffix string, err
 		// Use the sharding key value if available
 		suffix, err = r.ShardingAlgorithm(value)
 		if err != nil {
-			log.Printf("Error in ShardingAlgorithm: %v\n", err)
+			GetLogger().Error("Error in ShardingAlgorithm: %v", err)
 
 			// Fall back to ID-based routing if available
 			if id != 0 && r.ShardingAlgorithmByPrimaryKey != nil {
 				suffix = r.ShardingAlgorithmByPrimaryKey(id)
-				log.Printf("Falling back to ID-based routing: %d -> %s\n", id, suffix)
+				GetLogger().Debug("Falling back to ID-based routing: %d -> %s", id, suffix)
 				return suffix, nil
 			}
 
 			return "", err
 		}
-		//log.Printf("Sharding key value: %v, Suffix: %s\n", value, suffix)
+		//GetLogger().Debug("Sharding key value: %v, Suffix: %s", value, suffix)
 	} else if id != 0 {
 		// Use ID-based routing when no value or value is nil
 		if r.ShardingAlgorithmByPrimaryKey == nil {
 			err = fmt.Errorf("there is no sharding key and ShardingAlgorithmByPrimaryKey is not configured")
-			log.Printf("Error: %v\n", err)
+			GetLogger().Error("Error: %v", err)
 			return
 		}
 		suffix = r.ShardingAlgorithmByPrimaryKey(id)
-		log.Printf("Sharding by primary key: %d, Suffix: %s\n", id, suffix)
+		GetLogger().Debug("Sharding by primary key: %d, Suffix: %s", id, suffix)
 	} else {
 		err = ErrMissingShardingKey
 		return
@@ -2289,7 +2314,7 @@ func defaultListAlgorithm(config *Config) func(value any) (string, error) {
 		}
 
 		// Debug log the exact value being looked up
-		log.Printf("Looking up partition for value: '%s' in ListValues map: %v", strValue, config.ListValues)
+		GetLogger().Debug("Looking up partition for value: '%s' in ListValues map: %v", strValue, config.ListValues)
 
 		// Look up partition number in ListValues map
 		partitionNum, exists := config.ListValues[strValue]
@@ -2299,7 +2324,7 @@ func defaultListAlgorithm(config *Config) func(value any) (string, error) {
 				if strings.EqualFold(key, strValue) {
 					partitionNum = val
 					exists = true
-					log.Printf("Found partition %d for case-insensitive value '%s' matching key '%s'", partitionNum, strValue, key)
+					GetLogger().Debug("Found partition %d for case-insensitive value '%s' matching key '%s'", partitionNum, strValue, key)
 					break
 				}
 			}
@@ -2308,13 +2333,13 @@ func defaultListAlgorithm(config *Config) func(value any) (string, error) {
 			if !exists {
 				if config.DefaultPartition >= 0 {
 					partitionNum = config.DefaultPartition
-					log.Printf("Using default partition %d for value '%s'", partitionNum, strValue)
+					GetLogger().Debug("Using default partition %d for value '%s'", partitionNum, strValue)
 				} else {
 					return "", fmt.Errorf("value '%s' not found in partition list", strValue)
 				}
 			}
 		} else {
-			log.Printf("Found partition %d for value '%s'", partitionNum, strValue)
+			GetLogger().Debug("Found partition %d for value '%s'", partitionNum, strValue)
 		}
 
 		return fmt.Sprintf(config.tableFormat, partitionNum), nil
@@ -2416,4 +2441,145 @@ func containsLowerFunctionInExpr(expr *pg_query.Node) bool {
 		}
 	}
 	return false
+}
+
+// handleMultiShardInsert processes batch inserts with records belonging to different shards.
+// It detects this situation and splits the batch into per-shard operations to avoid
+// the "can not insert different suffix table in one query" error.
+func (s *Sharding) handleMultiShardInsert(db *gorm.DB) error {
+	// Extract table name from the statement
+	tableName := db.Statement.Table
+
+	// Check if this table is configured for sharding
+	config, exists := s.configs[tableName]
+	if !exists {
+		// Not a sharded table, proceed normally
+		return nil
+	}
+
+	// Get the value being inserted
+	reflectValue := db.Statement.ReflectValue
+	if reflectValue.Kind() != reflect.Slice {
+		// Not a batch operation, proceed normally
+		return nil
+	}
+
+	// If we have only 0 or 1 record, proceed normally
+	if reflectValue.Len() <= 1 {
+		return nil
+	}
+
+	// Enhanced logging
+	GetLogger().Debug("Processing batch insert with %d records for table %s", reflectValue.Len(), tableName)
+
+	// Group records by sharding key value to ensure complete separation
+	recordsByShardingKey := make(map[interface{}][]interface{})
+	shardsBySuffix := make(map[string][]interface{}) // For logging purposes
+
+	// Process each record to determine its shard
+	for i := 0; i < reflectValue.Len(); i++ {
+		// Get the record
+		record := reflectValue.Index(i).Interface()
+
+		// Extract sharding key value
+		var keyValue interface{}
+		recordValue := reflect.ValueOf(record)
+		if recordValue.Kind() == reflect.Ptr {
+			recordValue = recordValue.Elem()
+		}
+
+		// Handle struct records
+		if recordValue.Kind() == reflect.Struct {
+			for j := 0; j < recordValue.NumField(); j++ {
+				fieldName := recordValue.Type().Field(j).Name
+				if strings.EqualFold(fieldName, config.ShardingKey) {
+					keyValue = recordValue.Field(j).Interface()
+					break
+				}
+			}
+		} else if recordValue.Kind() == reflect.Map {
+			// Handle map records
+			for _, key := range recordValue.MapKeys() {
+				if key.String() == config.ShardingKey {
+					keyValue = recordValue.MapIndex(key).Interface()
+					break
+				}
+			}
+		}
+
+		if keyValue == nil {
+			// If we can't find the sharding key, proceed with normal processing
+			// It might fail later, but that's the expected behavior
+			GetLogger().Debug("Could not extract sharding key %s from record %d, proceeding with normal processing", config.ShardingKey, i)
+			return nil
+		}
+
+		// Get shard suffix for this record
+		suffix, err := getSuffix(keyValue, 0, true, config)
+		if err != nil {
+			return err
+		}
+
+		// Add the sharding key to the logging map
+		keysForSuffix := shardsBySuffix[suffix]
+		keyExists := false
+		for _, existingKey := range keysForSuffix {
+			if existingKey == keyValue {
+				keyExists = true
+				break
+			}
+		}
+		if !keyExists {
+			shardsBySuffix[suffix] = append(shardsBySuffix[suffix], keyValue)
+		}
+
+		// Add record to the appropriate group BY SHARDING KEY VALUE
+		// This is the key change - group by sharding key value, not by suffix
+		recordsByShardingKey[keyValue] = append(recordsByShardingKey[keyValue], record)
+	}
+
+	// If all records share the same sharding key, proceed normally
+	if len(recordsByShardingKey) <= 1 {
+		GetLogger().Debug("All %d records have the same sharding key, proceeding with normal processing", reflectValue.Len())
+		return nil
+	}
+
+	// Enhanced logging to show what sharding keys map to which suffixes
+	for suffix, keys := range shardsBySuffix {
+		GetLogger().Debug("Shard suffix %s will receive records with sharding keys: %v", suffix, keys)
+	}
+
+	// Multiple sharding keys detected - we need to split the operation
+	GetLogger().Debug("Detected batch insert with records for %d different sharding key values", len(recordsByShardingKey))
+
+	// Process each group separately
+	for keyValue, records := range recordsByShardingKey {
+		// Create a new session with the same settings
+		session := db.Session(&gorm.Session{})
+
+		// Create a new slice with the same type as the original
+		newSlice := reflect.MakeSlice(reflectValue.Type(), 0, len(records))
+		for _, record := range records {
+			newSlice = reflect.Append(newSlice, reflect.ValueOf(record))
+		}
+
+		// Convert to interface
+		sliceInterface := newSlice.Interface()
+
+		// Get the suffix for this key value (for logging)
+		suffix, _ := getSuffix(keyValue, 0, true, config)
+
+		// Create records for this shard
+		GetLogger().Debug("Processing batch of %d records for sharding key %v (suffix %s)",
+			len(records), keyValue, suffix)
+
+		if err := session.Create(sliceInterface).Error; err != nil {
+			return fmt.Errorf("failed to insert records for sharding key %v (suffix %s): %w",
+				keyValue, suffix, err)
+		}
+	}
+
+	// Skip the default processing since we've handled it
+	db.SkipDefaultTransaction = true
+	return nil
 }
