@@ -528,17 +528,64 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				// Check if we're using LOWER function on a column that might be a sharding key
 				for _, condition := range conditions {
 					if containsLowerFunction(condition) {
-						// If we're using LOWER, we'll allow the query to proceed with double write
+						// If we're using LOWER, we'll try to extract the sharding key value
 						// This is a special case for queries like "WHERE LOWER(name) = LOWER('value')"
 						if tableName == "" && len(tables) > 0 {
 							tableName = tables[0]
 						}
-						// For tables with DoubleWrite enabled, allow the query to proceed
+
+						// Create a map to store table aliases
+						var aliasMap map[string]string
+						if isSelect {
+							aliasMap = make(map[string]string)
+							// Collect aliases from the FROM clause
+							for _, fromItem := range selectStmt.FromClause {
+								if joinExpr, ok := fromItem.Node.(*pg_query.Node_JoinExpr); ok {
+									mergeMaps(aliasMap, collectAliasesFromJoin(joinExpr.JoinExpr))
+								} else if rangeVar, ok := fromItem.Node.(*pg_query.Node_RangeVar); ok {
+									if rangeVar.RangeVar.Alias != nil {
+										aliasMap[rangeVar.RangeVar.Alias.Aliasname] = rangeVar.RangeVar.Relname
+									}
+								}
+							}
+						}
+
+						// For tables with DoubleWrite enabled, try to determine the appropriate sharded table
 						for _, table := range tables {
 							s.mutex.RLock()
 							cfg, ok := s.configs[table]
 							s.mutex.RUnlock()
 							if ok && cfg.DoubleWrite {
+								// Create a map to store known keys for this extraction
+								localKnownKeys := make(map[string]interface{})
+
+								// Extract sharding key value from LOWER function
+								for _, condition := range conditions {
+									if containsLowerFunction(condition) {
+										shardingKey := cfg.ShardingKey
+										keyFound, value, err := extractShardingKeyFromLowerFunction(shardingKey, condition, args, localKnownKeys, aliasMap)
+										if keyFound && err == nil && value != nil {
+											// If we found a sharding key in a LOWER function, use it to determine the suffix
+											suffix, err := getSuffix(value, 0, true, cfg)
+											if err == nil {
+												// Add the sharded table to the tableMap
+												shardedTableName := table + suffix
+												tableMapMutex.Lock()
+												tableMap[table] = shardedTableName
+												tableMapMutex.Unlock()
+												GetLogger().Debug("Using sharded table %s for LOWER function on sharding key %s with value %v",
+													shardedTableName, shardingKey, value)
+											}
+										}
+									}
+								}
+
+								// If we've added entries to tableMap, we can proceed
+								if len(tableMap) > 0 {
+									return ftQuery, stQuery, tableName, nil
+								}
+
+								// Otherwise, allow the query to proceed with double write
 								return ftQuery, stQuery, tableName, nil
 							}
 						}
@@ -778,8 +825,31 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				s.mutex.RLock()
 				cfg, ok := s.configs[fullTableName]
 				s.mutex.RUnlock()
+				// If this is a SELECT with LOWER function on sharding key and DoubleWrite is enabled,
+				// we need to determine the appropriate sharded table for tables with sharding keys
 				if ok && cfg.DoubleWrite && containsLowerFunction(selectStmt.WhereClause) {
-					return ftQuery, stQuery, tableName, nil
+					// Create a map to store known keys for this extraction
+					localKnownKeys := make(map[string]interface{})
+
+					// Extract sharding key value from LOWER function
+					for _, condition := range conditions {
+						if containsLowerFunction(condition) {
+							keyFound, value, err := extractShardingKeyFromLowerFunction(shardingKey, condition, args, localKnownKeys, aliasMap)
+							if keyFound && err == nil && value != nil {
+								// If we found a sharding key in a LOWER function, use it to determine the suffix
+								suffix, err := getSuffix(value, 0, true, r)
+								if err == nil {
+									// Add the sharded table to the tableMap
+									shardedTableName := fullTableName + suffix
+									tableMapMutex.Lock()
+									tableMap[fullTableName] = shardedTableName
+									tableMapMutex.Unlock()
+									GetLogger().Debug("Using sharded table %s for LOWER function on sharding key %s with value %v",
+										shardedTableName, shardingKey, value)
+								}
+							}
+						}
+					}
 				}
 				return ftQuery, stQuery, tableName, err
 			}
