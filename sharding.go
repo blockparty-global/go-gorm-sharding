@@ -916,8 +916,24 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 								colName := extractColumnName(argColRef.ColumnRef, aliasMap)
 								GetLogger().Debug("Checking LEFT for sharding key in LOWER function: %s %s", colName, getColumnNameWithoutTable(colName))
 								if getColumnNameWithoutTable(colName) == shardingKey {
-									GetLogger().Debug("Checking LEFT for sharding1 key in LOWER function: %s", colName)
-									// Found sharding key in LOWER function, extract value from right side
+									GetLogger().Debug("Found LEFT sharding key in LOWER function: %s", colName)
+
+									// Check if right side is also a LOWER function
+									if rightFuncCall, ok := n.AExpr.Rexpr.Node.(*pg_query.Node_FuncCall); ok {
+										if len(rightFuncCall.FuncCall.Funcname) > 0 {
+											rightFuncName := rightFuncCall.FuncCall.Funcname[0].Node.(*pg_query.Node_String_).String_.Sval
+											if strings.EqualFold(rightFuncName, "lower") && len(rightFuncCall.FuncCall.Args) > 0 {
+												// Extract value from right LOWER function argument
+												rightVal, err := extractValueFromExpr(rightFuncCall.FuncCall.Args[0], args)
+												if err == nil && rightVal != nil {
+													GetLogger().Debug("Found sharding key %s in LOWER function with LOWER on both sides: value=%v", shardingKey, rightVal)
+													return true, rightVal, nil
+												}
+											}
+										}
+									}
+
+									// If right side is not a LOWER function, extract value directly
 									rightVal, err := extractValueFromExpr(n.AExpr.Rexpr, args)
 									if err == nil && rightVal != nil {
 										GetLogger().Debug("Found sharding key %s in LOWER function: value=%v", shardingKey, rightVal)
@@ -939,8 +955,24 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 								colName := extractColumnName(argColRef.ColumnRef, aliasMap)
 								GetLogger().Debug("Checking RIGHT for sharding key in LOWER function: %s", colName)
 								if getColumnNameWithoutTable(colName) == shardingKey {
-									GetLogger().Debug("Found RIGHT sharding key in LOWER function: value=%s", colName)
-									// Found sharding key in LOWER function, extract value from left side
+									GetLogger().Debug("Found RIGHT sharding key in LOWER function: %s", colName)
+
+									// Check if left side is also a LOWER function
+									if leftFuncCall, ok := n.AExpr.Lexpr.Node.(*pg_query.Node_FuncCall); ok {
+										if len(leftFuncCall.FuncCall.Funcname) > 0 {
+											leftFuncName := leftFuncCall.FuncCall.Funcname[0].Node.(*pg_query.Node_String_).String_.Sval
+											if strings.EqualFold(leftFuncName, "lower") && len(leftFuncCall.FuncCall.Args) > 0 {
+												// Extract value from left LOWER function argument
+												leftVal, err := extractValueFromExpr(leftFuncCall.FuncCall.Args[0], args)
+												if err == nil && leftVal != nil {
+													GetLogger().Debug("Found sharding key %s in LOWER function with LOWER on both sides: value=%v", shardingKey, leftVal)
+													return true, leftVal, nil
+												}
+											}
+										}
+									}
+
+									// If left side is not a LOWER function, extract value directly
 									leftVal, err := extractValueFromExpr(n.AExpr.Lexpr, args)
 									if err == nil && leftVal != nil {
 										GetLogger().Debug("Found sharding key %s in LOWER function: value=%v", shardingKey, leftVal)
@@ -970,6 +1002,7 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 											// Extract value from right LOWER function argument
 											rightVal, err := extractValueFromExpr(rightFuncCall.FuncCall.Args[0], args)
 											if err == nil && rightVal != nil {
+												GetLogger().Debug("Found sharding key %s in LOWER function (both sides): value=%v", shardingKey, rightVal)
 												return true, rightVal, nil
 											}
 										}
@@ -982,6 +1015,7 @@ func extractShardingKeyFromLowerFunction(shardingKey string, node *pg_query.Node
 											// Extract value from left LOWER function argument
 											leftVal, err := extractValueFromExpr(leftFuncCall.FuncCall.Args[0], args)
 											if err == nil && leftVal != nil {
+												GetLogger().Debug("Found sharding key %s in LOWER function (both sides): value=%v", shardingKey, leftVal)
 												return true, leftVal, nil
 											}
 										}

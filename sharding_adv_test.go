@@ -2,13 +2,14 @@ package sharding
 
 import (
 	"fmt"
+	"testing"
+	"time"
+
 	tassert "github.com/stretchr/testify/assert"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 	"gorm.io/hints"
-	"testing"
-	"time"
 )
 
 type TokenWithHashPartition struct {
@@ -34,6 +35,256 @@ type ContractWithHashPartition struct {
 	IsERC1155 bool
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+func TestLowerFunctionOnShardingKey(t *testing.T) {
+	// Create a test DB with proper configuration
+	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
+	})
+	if err != nil {
+		t.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	// Set up hash partitioning with token_id as the sharding key for tokens
+	tokenConfig := Config{
+		DoubleWrite:         true,
+		ShardingKey:         "token_id", // token_id is the sharding key for tokens
+		PartitionType:       PartitionTypeHash,
+		NumberOfShards:      4,
+		ShardingAlgorithm:   shardingHasher4Algorithm,
+		PrimaryKeyGenerator: PKSnowflake,
+		ShardingSuffixs: func() []string {
+			return []string{"_0", "_1", "_2", "_3"}
+		},
+	}
+
+	// Set up hash partitioning with name as the sharding key for contracts
+	contractConfig := Config{
+		DoubleWrite:         true,
+		ShardingKey:         "name", // name is the sharding key for contracts
+		PartitionType:       PartitionTypeHash,
+		NumberOfShards:      4,
+		ShardingAlgorithm:   shardingHasher4Algorithm,
+		PrimaryKeyGenerator: PKSnowflake,
+		ShardingSuffixs: func() []string {
+			return []string{"_0", "_1", "_2", "_3"}
+		},
+	}
+
+	// Register the middleware with both configurations
+	configs := map[string]Config{
+		"token_with_hash_partitions":    tokenConfig,
+		"contract_with_hash_partitions": contractConfig,
+	}
+
+	middleware := Register(configs, &TokenWithHashPartition{}, &ContractWithHashPartition{})
+	testDB.Use(middleware)
+
+	// Drop and recreate tables
+	testDB.Exec("DROP TABLE IF EXISTS token_with_hash_partitions")
+	testDB.Exec("DROP TABLE IF EXISTS contract_with_hash_partitions")
+	for i := 0; i < 4; i++ {
+		testDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS token_with_hash_partitions_%d", i))
+		testDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS contract_with_hash_partitions_%d", i))
+	}
+
+	// Auto migrate to create the tables
+	err = testDB.AutoMigrate(&TokenWithHashPartition{}, &ContractWithHashPartition{})
+	if err != nil {
+		t.Fatalf("Failed to migrate tables: %v", err)
+	}
+
+	// Create sharded tables manually
+	for i := 0; i < 4; i++ {
+		// Create token tables
+		testDB.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS token_with_hash_partitions_%d (
+			id bigint PRIMARY KEY,
+			contract text,
+			token_id text,
+			token_uri_status text,
+			token_uri text,
+			name text,
+			description text,
+			created_at timestamp with time zone,
+			updated_at timestamp with time zone
+		)`, i))
+
+		// Create contract tables
+		testDB.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS contract_with_hash_partitions_%d (
+			id bigint PRIMARY KEY,
+			address text,
+			name text,
+			type text,
+			is_erc20 boolean,
+			is_erc721 boolean,
+			is_erc1155 boolean,
+			created_at timestamp with time zone,
+			updated_at timestamp with time zone
+		)`, i))
+	}
+
+	// Insert test contracts
+	contracts := []ContractWithHashPartition{
+		{Address: "0xabc123", Name: "NOBUYSOK", Type: "ERC721", IsERC721: true},
+		{Address: "0xdef456", Name: "nobuysok", Type: "ERC721", IsERC721: true},
+		{Address: "0xghi789", Name: "Nobuysok", Type: "ERC721", IsERC721: true},
+		{Address: "0xjkl012", Name: "OtherToken", Type: "ERC721", IsERC721: true},
+	}
+
+	// Insert the contracts
+	for _, contract := range contracts {
+		err := testDB.Create(&contract).Error
+		tassert.NoError(t, err, "Failed to insert contract")
+		t.Logf("Created contract with address %s, name %s, ID %d", contract.Address, contract.Name, contract.ID)
+	}
+
+	// Insert tokens for each contract
+	for _, contract := range contracts {
+		// Create multiple tokens per contract
+		for i := 1; i <= 3; i++ {
+			token := TokenWithHashPartition{
+				Contract:       contract.Address,
+				TokenID:        fmt.Sprintf("%d", i),
+				TokenURIStatus: "READY",
+				Name:           fmt.Sprintf("%s #%d", contract.Name, i),
+				Description:    fmt.Sprintf("Token %d for contract %s", i, contract.Name),
+				CreatedAt:      time.Now(),
+				UpdatedAt:      time.Now(),
+			}
+
+			err := testDB.Create(&token).Error
+			tassert.NoError(t, err, "Failed to insert token")
+			t.Logf("Created token with ID %d, contract %s, tokenID %s", token.ID, token.Contract, token.TokenID)
+		}
+	}
+
+	// Test 1: This test reproduces the error - using LOWER on the sharding key
+	t.Run("ReproduceError_LowerOnShardingKey", func(t *testing.T) {
+		var results []struct {
+			TokenWithHashPartition
+			ContractName string
+		}
+
+		// This query should fail because it uses LOWER on the sharding key (contracts.name)
+		// without providing a direct equality condition on the sharding key
+		err := testDB.Table("token_with_hash_partitions").
+			Select("token_with_hash_partitions.*, contract_with_hash_partitions.name as contract_name").
+			Joins("JOIN contract_with_hash_partitions ON token_with_hash_partitions.contract = contract_with_hash_partitions.address").
+			Where("LOWER(contract_with_hash_partitions.name) = LOWER(?)", "NOBUYSOK").
+			Limit(10).
+			Find(&results).Error
+
+		// This should fail with "sharding key or id required, and use operator ="
+		tassert.Error(t, err, "Query should fail with sharding key error")
+		tassert.Contains(t, err.Error(), "sharding key or id required", "Error should mention sharding key requirement")
+
+		t.Logf("Expected error received: %v", err)
+		t.Logf("Last query: %s", middleware.LastQuery())
+	})
+
+	// Test 2: Fix 1 - Use direct equality on the sharding key
+	t.Run("Fix1_DirectEqualityOnShardingKey", func(t *testing.T) {
+		var results []struct {
+			TokenWithHashPartition
+			ContractName string
+		}
+
+		// This query should succeed because it uses direct equality on both sharding keys
+		err := testDB.Table("token_with_hash_partitions").
+			Select("token_with_hash_partitions.*, contract_with_hash_partitions.name as contract_name").
+			Joins("JOIN contract_with_hash_partitions ON token_with_hash_partitions.contract = contract_with_hash_partitions.address").
+			Where("contract_with_hash_partitions.name = ?", "NOBUYSOK").
+			Where("token_with_hash_partitions.token_id = ?", "1"). // Add token_id sharding key
+			Limit(10).
+			Find(&results).Error
+
+		tassert.NoError(t, err, "Query with direct equality should succeed")
+		tassert.GreaterOrEqual(t, len(results), 1, "Should find at least one result")
+
+		t.Logf("Found %d results with direct equality", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+	})
+
+	// Test 3: Fix 2 - Use IN clause for case-insensitive matching
+	t.Run("Fix2_InClauseForCaseInsensitiveMatching", func(t *testing.T) {
+		var results []struct {
+			TokenWithHashPartition
+			ContractName string
+		}
+
+		// This query should succeed because it uses direct equality with multiple case variations
+		err := testDB.Table("token_with_hash_partitions").
+			Select("token_with_hash_partitions.*, contract_with_hash_partitions.name as contract_name").
+			Joins("JOIN contract_with_hash_partitions ON token_with_hash_partitions.contract = contract_with_hash_partitions.address").
+			Where("contract_with_hash_partitions.name IN ?", []string{"NOBUYSOK", "nobuysok", "Nobuysok"}).
+			Limit(10).
+			Find(&results).Error
+
+		tassert.NoError(t, err, "Query with IN clause should succeed")
+		tassert.GreaterOrEqual(t, len(results), 3, "Should find at least three results (one for each case variation)")
+
+		t.Logf("Found %d results with IN clause", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+	})
+
+	// Test 4: Fix 3 - Use nosharding hint for queries that need LOWER function
+	t.Run("Fix3_UseNoshardingHint", func(t *testing.T) {
+		var results []struct {
+			TokenWithHashPartition
+			ContractName string
+		}
+
+		// This query should succeed because it uses the nosharding hint
+		err := testDB.Table("token_with_hash_partitions").
+			Clauses(hints.New("nosharding")).
+			Select("token_with_hash_partitions.*, contract_with_hash_partitions.name as contract_name").
+			Joins("JOIN contract_with_hash_partitions ON token_with_hash_partitions.contract = contract_with_hash_partitions.address").
+			Where("LOWER(contract_with_hash_partitions.name) = LOWER(?)", "NOBUYSOK").
+			Limit(10).
+			Find(&results).Error
+
+		tassert.NoError(t, err, "Query with nosharding hint should succeed")
+		tassert.GreaterOrEqual(t, len(results), 3, "Should find at least three results (one for each case variation)")
+
+		t.Logf("Found %d results with nosharding hint", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+	})
+
+	// Test 5: Fix 4 - Use a subquery to get the contract IDs first, then query tokens
+	t.Run("Fix4_UseSubqueryApproach", func(t *testing.T) {
+		// First, get the contract addresses with the case-insensitive name match
+		var contractAddresses []string
+		err := testDB.Table("contract_with_hash_partitions").
+			Clauses(hints.New("nosharding")).
+			Where("LOWER(name) = LOWER(?)", "NOBUYSOK").
+			Pluck("address", &contractAddresses).Error
+
+		tassert.NoError(t, err, "Subquery for contract addresses should succeed")
+		tassert.GreaterOrEqual(t, len(contractAddresses), 3, "Should find at least three contract addresses")
+
+		// If we found contract addresses, now query tokens with those addresses
+		if len(contractAddresses) > 0 {
+			var results []struct {
+				TokenWithHashPartition
+				ContractName string
+			}
+
+			err := testDB.Table("token_with_hash_partitions").
+				Select("token_with_hash_partitions.*, contract_with_hash_partitions.name as contract_name").
+				Joins("JOIN contract_with_hash_partitions ON token_with_hash_partitions.contract = contract_with_hash_partitions.address").
+				Where("token_with_hash_partitions.contract IN ?", contractAddresses).
+				Limit(10).
+				Find(&results).Error
+
+			tassert.NoError(t, err, "Query with contract addresses should succeed")
+			tassert.GreaterOrEqual(t, len(results), 3, "Should find at least three results")
+
+			t.Logf("Found %d results with subquery approach", len(results))
+			t.Logf("Last query: %s", middleware.LastQuery())
+		}
+	})
 }
 
 func TestHashPartitioningWithLowerFunction(t *testing.T) {
