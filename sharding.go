@@ -533,7 +533,17 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 						if tableName == "" && len(tables) > 0 {
 							tableName = tables[0]
 						}
-						return ftQuery, stQuery, tableName, nil
+						// For tables with DoubleWrite enabled, allow the query to proceed
+						for _, table := range tables {
+							s.mutex.RLock()
+							cfg, ok := s.configs[table]
+							s.mutex.RUnlock()
+							if ok && cfg.DoubleWrite {
+								return ftQuery, stQuery, tableName, nil
+							}
+						}
+						// If no table has DoubleWrite enabled, return the original error
+						return ftQuery, stQuery, tableName, ErrMissingShardingKey
 					}
 				}
 
@@ -764,6 +774,13 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			// Extract sharding key for the current table
 			value, id, keyFound, err := s.extractShardingKeyFromConditions(shardingKey, conditions, args, aliasMap, fullTableName)
 			if err != nil {
+				// Check if DoubleWrite is enabled for this table
+				s.mutex.RLock()
+				cfg, ok := s.configs[fullTableName]
+				s.mutex.RUnlock()
+				if ok && cfg.DoubleWrite && containsLowerFunction(selectStmt.WhereClause) {
+					return ftQuery, stQuery, tableName, nil
+				}
 				return ftQuery, stQuery, tableName, err
 			}
 
