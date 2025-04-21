@@ -67,7 +67,6 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 
 	// Try to handle batch insert queries
 	queryCtx := &QueryContext{
-		Sharding: pool.sharding,
 		ConnPool: pool.ConnPool,
 	}
 	result, err = pool.sharding.HandleBatchInsert(queryCtx, query, args)
@@ -87,33 +86,54 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 	// Using sync.Map prevents race conditions in concurrent environments
 	pool.sharding.querys.Store("last_query", stQuery)
 
-	// ErrInsertDiffSuffix check to handle multi-shard inserts
+	// Modified error handling: for multi-shard INSERT operations, always try the batch handler
 	if err != nil && errors.Is(err, ErrInsertDiffSuffix) {
-		// When we detect multiple shards, try to use the batch handler
+		// When dealing with an INSERT with multiple shards, we'll try to use the batch handler
 		if strings.Contains(strings.ToUpper(query), "INSERT INTO") {
-			GetLogger().Debug("Detected INSERT with multiple shards, attempting batch handler")
+			GetLogger().Debug("Detected INSERT with multiple shards, using batch handler")
 
-			// Try to handle batch insert queries
-			queryCtx := &QueryContext{
-				Sharding: pool.sharding,
-				ConnPool: pool.ConnPool,
+			// Try specialized batch handler for multi-shard inserts
+			// Create separate queries for each shard and execute them
+			queries, queryParams, splitErr := pool.sharding.SplitBatchInsertByShards(query, args)
+			if splitErr == nil && len(queries) > 0 {
+				// Execute each query separately
+				var rowsAffected int64
+
+				for i, shardQuery := range queries {
+					if DefaultLogLevel >= LogLevelDebug {
+						debugLog("Executing shard-specific batch insert (%d/%d): %s", i+1, len(queries), shardQuery)
+					}
+
+					result, execErr := pool.ConnPool.ExecContext(ctx, shardQuery, queryParams[i]...)
+					if execErr != nil {
+						errorLog("Error executing shard query: %v", execErr)
+						return nil, fmt.Errorf("error executing shard %d: %w", i, execErr)
+					}
+
+					// Keep track of rows affected for final result
+					rows, _ := result.RowsAffected()
+					rowsAffected += rows
+				}
+
+				// Store the last result for the batchResult
+				var lastResult sql.Result = result
+
+				// Create a combined result
+				return &batchResult{
+					lastResult:   lastResult,
+					rowsAffected: rowsAffected,
+				}, nil
 			}
 
-			result, batchErr := pool.sharding.HandleBatchInsert(queryCtx, query, args)
-			if batchErr == nil {
-				// Batch insert was handled successfully
-				GetLogger().Debug("Successfully handled multi-shard batch insert")
-				return result, nil
-			}
-
-			// If batch handling failed, log and continue with original error
-			GetLogger().Debug("Batch handler failed: %v, proceeding with original error", batchErr)
+			// If we couldn't split the batch, log the error
+			errorLog("Failed to split multi-shard batch: %v", splitErr)
 		}
 
+		// If we couldn't handle it after all, return the original error
 		return nil, err
 	}
 
-	// Double-write ensures data consistency during migration from non-sharded to sharded tables
+	// Missing sharding key with double-write enabled allows fallback to original table
 	if table != "" && err != nil && errors.Is(err, ErrMissingShardingKey) {
 		pool.sharding.mutex.RLock()
 		doubleWrite := true
@@ -190,27 +210,35 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 	debugLog("QueryContext: FtQuery: %s\n StQuery: %s \n\tQuery: %s \n Table: %s. Error: %v",
 		ftQuery, stQuery, query, table, err)
 
-	// ErrInsertDiffSuffix check is first to fail fast and prevent data corruption from partial operations
+	// Modified error handling for multi-shard operations
 	if err != nil && errors.Is(err, ErrInsertDiffSuffix) {
-		// When we detect multiple shards, try to use the batch handler
+		// When dealing with an INSERT with multiple shards, try to handle it specially
 		if strings.Contains(strings.ToUpper(query), "INSERT INTO") {
-			GetLogger().Debug("Detected INSERT with multiple shards, attempting batch handler")
+			debugLog("Detected INSERT with multiple shards in QueryContext, using batch handler")
 
-			// Try to handle batch insert queries
-			queryCtx := &QueryContext{
-				Sharding: pool.sharding,
-				ConnPool: pool.ConnPool,
-			}
+			// Create separate queries for each shard and execute them
+			queries, queryParams, splitErr := pool.sharding.SplitBatchInsertByShards(query, args)
+			if splitErr == nil && len(queries) > 0 {
+				// Execute each query separately
+				var rowsAffected int64
 
-			result, batchErr := pool.sharding.HandleBatchInsert(queryCtx, query, args)
-			if batchErr == nil {
-				// Batch insert was handled successfully
-				GetLogger().Debug("Successfully handled multi-shard batch insert")
+				for i, shardQuery := range queries {
+					if DefaultLogLevel >= LogLevelDebug {
+						debugLog("Executing shard-specific batch insert (%d/%d): %s", i+1, len(queries), shardQuery)
+					}
 
-				// For INSERT queries returning rows, create empty query result
-				// with just the number of affected rows
-				rowsAffected, _ := result.RowsAffected()
-				GetLogger().Debug("Batch insert affected %d rows", rowsAffected)
+					result, execErr := pool.ConnPool.ExecContext(ctx, shardQuery, queryParams[i]...)
+					if execErr != nil {
+						errorLog("Error executing shard query: %v", execErr)
+						return nil, fmt.Errorf("error executing shard %d: %w", i, execErr)
+					}
+
+					// Keep track of rows affected for final result
+					rows, _ := result.RowsAffected()
+					rowsAffected += rows
+				}
+
+				debugLog("Successfully executed multi-shard batch with %d rows affected", rowsAffected)
 
 				// For RETURNING clause, we need to return rows
 				if strings.Contains(strings.ToUpper(query), "RETURNING") {
@@ -224,10 +252,11 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 				return pool.ConnPool.QueryContext(ctx, "SELECT 1 WHERE 1=0", []interface{}{}...)
 			}
 
-			// If batch handling failed, log and continue with original error
-			GetLogger().Debug("Batch handler failed: %v, proceeding with original error", batchErr)
+			// If we couldn't split the batch, log the error
+			errorLog("Failed to split multi-shard batch: %v", splitErr)
 		}
 
+		// If we couldn't handle it after all, return the original error
 		return nil, err
 	}
 
