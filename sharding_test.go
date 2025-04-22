@@ -3,6 +3,8 @@ package sharding
 import (
 	"context"
 	"fmt"
+	tassert "github.com/stretchr/testify/assert"
+	"gorm.io/gorm/logger"
 	"log"
 	"os"
 	"sort"
@@ -11,11 +13,8 @@ import (
 	"testing"
 	"time"
 
-	tassert "github.com/stretchr/testify/assert"
-	"gorm.io/gorm/logger"
-
 	"github.com/bwmarrin/snowflake"
-	"github.com/longbridge/assert"
+	"github.com/longbridgeapp/assert"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
