@@ -8,7 +8,6 @@ import (
 	"math"
 	"math/big"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +15,6 @@ import (
 	"github.com/bwmarrin/snowflake"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
 // PartitionType defines the type of partitioning strategy
@@ -27,17 +25,12 @@ const (
 	PartitionTypeHash PartitionType = "hash"
 	// PartitionTypeList represents list-based partitioning
 	PartitionTypeList PartitionType = "list"
-	// PartitionTypeRange represents range-based partitioning
-	PartitionTypeRange PartitionType = "range"
 )
 
 var (
 	ErrMissingShardingKey = errors.New("sharding key or id required, and use operator =")
 	ErrInvalidID          = errors.New("invalid id format")
 	ErrInsertDiffSuffix   = errors.New("can not insert different suffix table in one query ")
-	// Commented out as these errors are already defined in batch_handler.go
-	// ErrSkipBatchHandler   = errors.New("skip batch handler")
-	// ErrParameterMismatch  = errors.New("parameter mismatch")
 )
 
 var (
@@ -142,8 +135,6 @@ type Config struct {
 	engine DatabaseEngine
 }
 
-// Register creates a new Sharding plugin instance with the given configuration
-// and optional tables to be sharded.
 func Register(config interface{}, tables ...interface{}) *Sharding {
 	// Load configuration from file
 	if err := LoadConfigFromFile(""); err != nil {
@@ -153,20 +144,11 @@ func Register(config interface{}, tables ...interface{}) *Sharding {
 	s := &Sharding{
 		_tables: tables,
 	}
-
-	// Initialize the configs map if it's nil
-	if s.configs == nil {
-		s.configs = make(map[string]Config)
-	}
-
 	switch c := config.(type) {
 	case Config:
 		s._config = c
 	case map[string]Config:
-		// Store the configuration map directly to configs
-		for tableName, tableConfig := range c {
-			s.configs[tableName] = tableConfig
-		}
+		s.configs = c
 	default:
 		panic("Invalid config type")
 	}
@@ -317,13 +299,6 @@ func (s *Sharding) compile() error {
 // Name plugin name for Gorm plugin interface
 func (s *Sharding) Name() string {
 	return "gorm:sharding"
-}
-
-// Build implements the clause.Expression interface.
-// This is required when using s in db.Clauses().
-func (s *Sharding) Build(builder clause.Builder) {
-	// This method is intentionally left empty as we don't need to modify the SQL directly.
-	// The actual query modification happens through callbacks registered in Initialize().
 }
 
 // LastQuery get last SQL query
@@ -730,10 +705,11 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 					suffixes[currentSuffix] = true
 
-					// If more than one unique suffix is found, we'll let the batch handler handle it
+					// If more than one unique suffix is found, return an error
 					if len(suffixes) > 1 {
-						// Previously returned ErrInsertDiffSuffix, now we'll use the batch handler via SplitBatchInsertByShards
-						GetLogger().Debug("Detected INSERT with multiple shards, will use batch handler")
+						// Return ErrInsertDiffSuffix to signal different sharding keys detected
+						tableName = originalTableName
+						return query, query, tableName, ErrInsertDiffSuffix
 					}
 
 					// Capture the consistent suffix
@@ -759,10 +735,11 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 					suffixes[currentSuffix] = true
 
-					// If more than one unique suffix is found, we'll let the batch handler handle it
+					// If more than one unique suffix is found, return an error
 					if len(suffixes) > 1 {
-						// Previously returned ErrInsertDiffSuffix, now we'll use the batch handler via SplitBatchInsertByShards
-						GetLogger().Debug("Detected INSERT with multiple shards, will use batch handler")
+						// Return ErrInsertDiffSuffix to signal different sharding keys detected
+						tableName = originalTableName
+						return query, query, tableName, ErrInsertDiffSuffix
 					}
 
 					// Capture the consistent suffix
@@ -773,15 +750,10 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			// Ensure all suffixes are consistent
 			if len(suffixes) == 1 {
 				suffix = consistentSuffix
-			} else if len(suffixes) > 1 {
-				// We'll now use the batch handler for multi-shard INSERT operations
-				GetLogger().Debug("Multiple shards detected (%d), will use batch handler", len(suffixes))
-				// We're returning the error here because batch inserts are handled by SplitBatchInsertByShards
+			} else {
+				// Return ErrInsertDiffSuffix to signal different sharding keys detected
 				tableName = originalTableName
 				return query, query, tableName, ErrInsertDiffSuffix
-			} else {
-				// No suffixes found
-				return query, query, tableName, ErrMissingShardingKey
 			}
 
 			shardedTableName := originalTableName + suffix
@@ -2731,489 +2703,4 @@ func (s *Sharding) handleMultiShardInsert(db *gorm.DB) error {
 	// Skip the default processing since we've handled it
 	db.SkipDefaultTransaction = true
 	return nil
-}
-
-// SplitBatchInsertByShards splits batch insert SQL into multiple queries, one for each shard
-// and returns a map of shard names to QueryContext.
-func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([]string, [][]interface{}, error) {
-	// Create a lookup table for matching value groups and parameters
-	queryContextMap := make(map[string]*QueryContext)
-
-	// Extract table name from SQL to determine sharding configuration
-	var tableName string
-
-	// Try to extract table name directly from the INSERT INTO pattern with quotes
-	reInsertQuoted := regexp.MustCompile(`(?i)INSERT\s+INTO\s+"([^"]+)"`)
-	if matches := reInsertQuoted.FindStringSubmatch(query); len(matches) >= 2 {
-		tableName = matches[1]
-	}
-
-	// If that didn't work, try without quotes
-	if tableName == "" {
-		reInsertUnquoted := regexp.MustCompile(`(?i)INSERT\s+INTO\s+([a-zA-Z0-9_]+)`)
-		if matches := reInsertUnquoted.FindStringSubmatch(query); len(matches) >= 2 {
-			tableName = matches[1]
-		}
-	}
-
-	// If still no table name, try the UPDATE pattern
-	if tableName == "" {
-		updateRe := regexp.MustCompile(`(?i)UPDATE\s+(?:"([a-zA-Z0-9_]+)"|([a-zA-Z0-9_]+))`)
-		updateMatches := updateRe.FindStringSubmatch(query)
-		if len(updateMatches) >= 3 {
-			// Match could be in group 1 or 2 depending on whether quotes were used
-			if updateMatches[1] != "" {
-				tableName = updateMatches[1]
-			} else if updateMatches[2] != "" {
-				tableName = updateMatches[2]
-			}
-		}
-	}
-
-	// If we still couldn't extract a table name, return an error
-	if tableName == "" {
-		return nil, nil, fmt.Errorf("couldn't extract table name from SQL: %s", query)
-	}
-
-	// Extract column names
-	reColumns := regexp.MustCompile(`(?i)INSERT\s+INTO\s+[^\(]+\(([^\)]+)\)`)
-	columnMatches := reColumns.FindStringSubmatch(query)
-	if len(columnMatches) < 2 {
-		return nil, nil, fmt.Errorf("couldn't extract column names from SQL: %s", query)
-	}
-
-	// Parse column names
-	columnNames := strings.Split(columnMatches[1], ",")
-	// Trim whitespace and quotes from column names
-	for i := range columnNames {
-		columnNames[i] = strings.TrimSpace(columnNames[i])
-		// Remove quotes if present
-		if strings.HasPrefix(columnNames[i], "\"") && strings.HasSuffix(columnNames[i], "\"") {
-			columnNames[i] = columnNames[i][1 : len(columnNames[i])-1]
-		}
-	}
-
-	// Find VALUES clause
-	valuesIdx := strings.Index(strings.ToUpper(query), "VALUES")
-	if valuesIdx == -1 {
-		return nil, nil, fmt.Errorf("VALUES clause not found in SQL: %s", query)
-	}
-
-	// Extract ON CONFLICT clause if present
-	var onConflictClause string
-
-	// Extract before getting value groups to ensure consistent SQL portions
-	beforeValues := query[:valuesIdx]
-	valuesClause := query[valuesIdx:]
-	onConflictIndex := strings.Index(strings.ToUpper(valuesClause), "ON CONFLICT")
-
-	if onConflictIndex != -1 {
-		onConflictClause = valuesClause[onConflictIndex:]
-		valuesClause = valuesClause[:onConflictIndex]
-	}
-
-	// Parse value groups
-	valueGroups := ParseValueGroups(valuesClause[6:]) // Skip "VALUES"
-	if len(valueGroups) == 0 {
-		return nil, nil, fmt.Errorf("no value groups found in SQL: %s", query)
-	}
-
-	// Perform thorough parameter validation before processing
-	// This validation runs regardless of whether we can find a sharding configuration
-	_, _, err := validateParameters(valueGroups, columnNames, args)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Identify sharding column position in the columns list
-	var shardingConfig Config
-	var shardingColumnIndex int = -1
-	var hasShardingKey bool = false
-
-	// Get sharding configuration for the table
-	// First check in configs map, which is populated by the Register method
-	s.mutex.RLock()
-	config, exists := s.configs[tableName]
-	s.mutex.RUnlock()
-
-	if !exists {
-		return nil, nil, ErrSkipBatchHandler
-	}
-
-	shardingConfig = config
-	if shardingConfig.ShardingKey == "" {
-		// No sharding key means table is not sharded
-		return nil, nil, ErrSkipBatchHandler
-	}
-
-	// Find the sharding key column position in the column list
-	for i, col := range columnNames {
-		if strings.EqualFold(col, shardingConfig.ShardingKey) {
-			shardingColumnIndex = i
-			hasShardingKey = true
-			break
-		}
-	}
-
-	if !hasShardingKey {
-		// If not found, it could be a table with auto-generated sharding key
-		return nil, nil, ErrSkipBatchHandler
-	}
-
-	// Small batch/Low cardinality optimization: Track parameter assignment across shards
-	paramTracking := make(map[int][]ParamAssignment, len(args))
-
-	// Handle value groups
-	for groupIdx, group := range valueGroups {
-		// Get the parameter index for the sharding column
-		paramIdx := getParamIndexFromGroup(group, shardingColumnIndex)
-
-		if paramIdx < 0 {
-			if paramIdx == -1 {
-				return nil, nil, fmt.Errorf("invalid parameter format at group %d, column %d", groupIdx, shardingColumnIndex)
-			}
-			// Handle literal value (paramIdx == -2)
-			// For literal sharding keys, we just use a default shard
-			if _, exists := queryContextMap["default"]; !exists {
-				queryContextMap["default"] = &QueryContext{
-					SQL:            beforeValues + "VALUES ",
-					Args:           make([]interface{}, 0),
-					ValueGroups:    make([]string, 0),
-					ParamPositions: make(map[int]int),
-					ShardingKey:    shardingConfig.ShardingKey,
-					TableName:      tableName,
-				}
-			}
-			queryContextMap["default"].ValueGroups = append(queryContextMap["default"].ValueGroups, group)
-			continue
-		}
-
-		// Check parameter index bounds
-		if paramIdx >= len(args) {
-			return nil, nil, fmt.Errorf("parameter index %d out of bounds for args length %d", paramIdx, len(args))
-		}
-
-		// Get the sharding key value
-		shardKeyValue := args[paramIdx]
-
-		// Calculate shard name
-		shardName, err := shardingConfig.ShardingAlgorithm(shardKeyValue)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error calculating shard for value %v: %w", shardKeyValue, err)
-		}
-
-		// Create or get the query context for this shard
-		if _, exists := queryContextMap[shardName]; !exists {
-			queryContextMap[shardName] = &QueryContext{
-				SQL:            beforeValues + "VALUES ",
-				Args:           make([]interface{}, 0),
-				ValueGroups:    make([]string, 0),
-				ParamPositions: make(map[int]int),
-				ShardingKey:    shardingConfig.ShardingKey,
-				TableName:      tableName,
-			}
-		}
-
-		// Extract all parameters from the current value group
-		// and track their mapping from original to per-shard positions
-		for colIdx := 0; colIdx < len(columnNames); colIdx++ {
-			colParamIdx := getParamIndexFromGroup(group, colIdx)
-			if colParamIdx >= 0 {
-				// Add parameter to this shard's args
-				queryContextMap[shardName].Args = append(queryContextMap[shardName].Args, args[colParamIdx])
-
-				// Update parameter tracking
-				paramAssignment := ParamAssignment{
-					ShardName:     shardName,
-					NewParamIndex: len(queryContextMap[shardName].Args) - 1,
-				}
-				paramTracking[colParamIdx] = append(paramTracking[colParamIdx], paramAssignment)
-
-				// Store the mapping between original parameter index and shard-specific index
-				queryContextMap[shardName].ParamPositions[colParamIdx] = len(queryContextMap[shardName].Args) - 1
-			}
-		}
-
-		// Add the value group to this shard
-		queryContextMap[shardName].ValueGroups = append(queryContextMap[shardName].ValueGroups, group)
-	}
-
-	// Process ON CONFLICT clause if present
-	if onConflictClause != "" {
-		err := processOnConflictClause(queryContextMap, onConflictClause, args, paramTracking)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error processing ON CONFLICT clause: %w", err)
-		}
-	}
-
-	// Prepare the final results
-	queries := make([]string, 0, len(queryContextMap))
-	queryParams := make([][]interface{}, 0, len(queryContextMap))
-
-	// Finalize queries for each shard
-	for shardName, context := range queryContextMap {
-		var finalValueGroups []string
-
-		// Adjust parameter indices in value groups based on the new positions
-		for _, group := range context.ValueGroups {
-			finalGroup, err := adjustParameterIndices(group, context.ParamPositions)
-			if err != nil {
-				return nil, nil, fmt.Errorf("error adjusting parameter indices for shard %s: %w", shardName, err)
-			}
-			finalValueGroups = append(finalValueGroups, finalGroup)
-		}
-
-		// Finalize the SQL with adjusted value groups
-		finalSQL := context.SQL + strings.Join(finalValueGroups, ", ")
-
-		// Add ON CONFLICT clause if present and processed
-		if context.OnConflictClause != "" {
-			finalSQL += " " + context.OnConflictClause
-		}
-
-		queries = append(queries, finalSQL)
-		queryParams = append(queryParams, context.Args)
-	}
-
-	return queries, queryParams, nil
-}
-
-// GetUpdateRegexPattern returns the regex pattern used for parsing UPDATE statements.
-// This function is primarily used for testing purposes.
-func GetUpdateRegexPattern() *regexp.Regexp {
-	return updateRegex
-}
-
-// TestSplitBatchInsertByShards is a specialized version of SplitBatchInsertByShards
-// designed for testing purposes. It works directly with the provided configuration
-// rather than requiring complex initialization.
-func TestSplitBatchInsertByShards(query string, args []interface{}, config map[string]Config) ([]string, [][]interface{}, error) {
-	// Create a lookup table for matching value groups and parameters
-	queryContextMap := make(map[string]*QueryContext)
-
-	// Extract table name from SQL to determine sharding configuration
-	var tableName string
-
-	// Try to extract table name directly from the INSERT INTO pattern with quotes
-	reInsertQuoted := regexp.MustCompile(`(?i)INSERT\s+INTO\s+"([^"]+)"`)
-	if matches := reInsertQuoted.FindStringSubmatch(query); len(matches) >= 2 {
-		tableName = matches[1]
-	}
-
-	// If that didn't work, try without quotes
-	if tableName == "" {
-		reInsertUnquoted := regexp.MustCompile(`(?i)INSERT\s+INTO\s+([a-zA-Z0-9_]+)`)
-		if matches := reInsertUnquoted.FindStringSubmatch(query); len(matches) >= 2 {
-			tableName = matches[1]
-		}
-	}
-
-	// If still no table name, try the UPDATE pattern
-	if tableName == "" {
-		updateRe := regexp.MustCompile(`(?i)UPDATE\s+(?:"([a-zA-Z0-9_]+)"|([a-zA-Z0-9_]+))`)
-		updateMatches := updateRe.FindStringSubmatch(query)
-		if len(updateMatches) >= 3 {
-			// Match could be in group 1 or 2 depending on whether quotes were used
-			if updateMatches[1] != "" {
-				tableName = updateMatches[1]
-			} else if updateMatches[2] != "" {
-				tableName = updateMatches[2]
-			}
-		}
-	}
-
-	// Last resort: if we still can't find the table, check if it's the specific test case
-	if tableName == "" {
-		if strings.Contains(query, "balance_balances") {
-			tableName = "balance_balances"
-		} else {
-			return nil, nil, fmt.Errorf("couldn't extract table name from SQL: %s", query)
-		}
-	}
-
-	// Extract column names
-	reColumns := regexp.MustCompile(`(?i)INSERT\s+INTO\s+[^\(]+\(([^\)]+)\)`)
-	columnMatches := reColumns.FindStringSubmatch(query)
-	if len(columnMatches) < 2 {
-		return nil, nil, fmt.Errorf("couldn't extract column names from SQL: %s", query)
-	}
-
-	// Parse column names
-	columnNames := strings.Split(columnMatches[1], ",")
-	// Trim whitespace and quotes from column names
-	for i := range columnNames {
-		columnNames[i] = strings.TrimSpace(columnNames[i])
-		// Remove quotes if present
-		if strings.HasPrefix(columnNames[i], "\"") && strings.HasSuffix(columnNames[i], "\"") {
-			columnNames[i] = columnNames[i][1 : len(columnNames[i])-1]
-		}
-	}
-
-	// Find VALUES clause
-	valuesIdx := strings.Index(strings.ToUpper(query), "VALUES")
-	if valuesIdx == -1 {
-		return nil, nil, fmt.Errorf("VALUES clause not found in SQL: %s", query)
-	}
-
-	// Extract ON CONFLICT clause if present
-	var onConflictClause string
-
-	// Extract before getting value groups to ensure consistent SQL portions
-	beforeValues := query[:valuesIdx]
-	valuesClause := query[valuesIdx:]
-	onConflictIndex := strings.Index(strings.ToUpper(valuesClause), "ON CONFLICT")
-
-	if onConflictIndex != -1 {
-		onConflictClause = valuesClause[onConflictIndex:]
-		valuesClause = valuesClause[:onConflictIndex]
-	}
-
-	// Parse value groups
-	valueGroups := ParseValueGroups(valuesClause[6:]) // Skip "VALUES"
-	if len(valueGroups) == 0 {
-		return nil, nil, fmt.Errorf("no value groups found in SQL: %s", query)
-	}
-
-	// Perform thorough parameter validation before processing
-	// This validation runs regardless of whether we can find a sharding configuration
-	_, _, err := validateParameters(valueGroups, columnNames, args)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Get the configuration for this table from the provided config map
-	shardingConfig, exists := config[tableName]
-	if !exists {
-		return nil, nil, fmt.Errorf("no configuration found for table %s", tableName)
-	}
-
-	// Find the sharding key position in columns
-	shardingColumnIndex := -1
-	for i, col := range columnNames {
-		if strings.EqualFold(col, shardingConfig.ShardingKey) {
-			shardingColumnIndex = i
-			break
-		}
-	}
-
-	if shardingColumnIndex == -1 {
-		return nil, nil, fmt.Errorf("sharding key %s not found in columns", shardingConfig.ShardingKey)
-	}
-
-	// Small batch/Low cardinality optimization: Track parameter assignment across shards
-	paramTracking := make(map[int][]ParamAssignment, len(args))
-
-	// Handle value groups
-	for groupIdx, group := range valueGroups {
-		// Get the parameter index for the sharding column
-		paramIdx := getParamIndexFromGroup(group, shardingColumnIndex)
-
-		if paramIdx < 0 {
-			if paramIdx == -1 {
-				return nil, nil, fmt.Errorf("invalid parameter format at group %d, column %d", groupIdx, shardingColumnIndex)
-			}
-			// Handle literal value (paramIdx == -2)
-			// For literal sharding keys, we just use a default shard
-			if _, exists := queryContextMap["default"]; !exists {
-				queryContextMap["default"] = &QueryContext{
-					SQL:            beforeValues + "VALUES ",
-					Args:           make([]interface{}, 0),
-					ValueGroups:    make([]string, 0),
-					ParamPositions: make(map[int]int),
-					ShardingKey:    shardingConfig.ShardingKey,
-					TableName:      tableName,
-				}
-			}
-			queryContextMap["default"].ValueGroups = append(queryContextMap["default"].ValueGroups, group)
-			continue
-		}
-
-		// Check parameter index bounds
-		if paramIdx >= len(args) {
-			return nil, nil, fmt.Errorf("parameter index %d out of bounds for args length %d", paramIdx, len(args))
-		}
-
-		// Get the sharding key value
-		shardKeyValue := args[paramIdx]
-
-		// Calculate shard name
-		shardName, err := shardingConfig.ShardingAlgorithm(shardKeyValue)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error calculating shard for value %v: %w", shardKeyValue, err)
-		}
-
-		// Create or get the query context for this shard
-		if _, exists := queryContextMap[shardName]; !exists {
-			queryContextMap[shardName] = &QueryContext{
-				SQL:            beforeValues + "VALUES ",
-				Args:           make([]interface{}, 0),
-				ValueGroups:    make([]string, 0),
-				ParamPositions: make(map[int]int),
-				ShardingKey:    shardingConfig.ShardingKey,
-				TableName:      tableName,
-			}
-		}
-
-		// Extract all parameters from the current value group
-		// and track their mapping from original to per-shard positions
-		for colIdx := 0; colIdx < len(columnNames); colIdx++ {
-			colParamIdx := getParamIndexFromGroup(group, colIdx)
-			if colParamIdx >= 0 {
-				// Add parameter to this shard's args
-				queryContextMap[shardName].Args = append(queryContextMap[shardName].Args, args[colParamIdx])
-
-				// Update parameter tracking
-				paramAssignment := ParamAssignment{
-					ShardName:     shardName,
-					NewParamIndex: len(queryContextMap[shardName].Args) - 1,
-				}
-				paramTracking[colParamIdx] = append(paramTracking[colParamIdx], paramAssignment)
-
-				// Store the mapping between original parameter index and shard-specific index
-				queryContextMap[shardName].ParamPositions[colParamIdx] = len(queryContextMap[shardName].Args) - 1
-			}
-		}
-
-		// Add the value group to this shard
-		queryContextMap[shardName].ValueGroups = append(queryContextMap[shardName].ValueGroups, group)
-	}
-
-	// Process ON CONFLICT clause if present
-	if onConflictClause != "" {
-		err := processOnConflictClause(queryContextMap, onConflictClause, args, paramTracking)
-		if err != nil {
-			return nil, nil, fmt.Errorf("error processing ON CONFLICT clause: %w", err)
-		}
-	}
-
-	// Prepare the final results
-	queries := make([]string, 0, len(queryContextMap))
-	queryParams := make([][]interface{}, 0, len(queryContextMap))
-
-	// Finalize queries for each shard
-	for shardName, context := range queryContextMap {
-		var finalValueGroups []string
-
-		// Adjust parameter indices in value groups based on the new positions
-		for _, group := range context.ValueGroups {
-			finalGroup, err := adjustParameterIndices(group, context.ParamPositions)
-			if err != nil {
-				return nil, nil, fmt.Errorf("error adjusting parameter indices for shard %s: %w", shardName, err)
-			}
-			finalValueGroups = append(finalValueGroups, finalGroup)
-		}
-
-		// Finalize the SQL with adjusted value groups
-		finalSQL := context.SQL + strings.Join(finalValueGroups, ", ")
-
-		// Add ON CONFLICT clause if present and processed
-		if context.OnConflictClause != "" {
-			finalSQL += " " + context.OnConflictClause
-		}
-
-		queries = append(queries, finalSQL)
-		queryParams = append(queryParams, context.Args)
-	}
-
-	return queries, queryParams, nil
 }
