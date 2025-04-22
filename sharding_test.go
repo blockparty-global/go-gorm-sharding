@@ -3,8 +3,6 @@ package sharding
 import (
 	"context"
 	"fmt"
-	tassert "github.com/stretchr/testify/assert"
-	"gorm.io/gorm/logger"
 	"log"
 	"os"
 	"sort"
@@ -12,6 +10,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	tassert "github.com/stretchr/testify/assert"
+	"gorm.io/gorm/logger"
 
 	"github.com/bwmarrin/snowflake"
 	"github.com/longbridgeapp/assert"
@@ -1934,13 +1935,16 @@ func TestConcurrentConnPoolOperations(t *testing.T) {
 			ShardingKey:         "user_id",
 			NumberOfShards:      4,
 			PrimaryKeyGenerator: PKSnowflake,
+			// ShardingSuffixs will be added in the next loop
 		}
 	}
 
 	for tableName, config := range configs {
+		// Capture the number of shards for the closure
+		numShards := int(config.NumberOfShards)
 		config.ShardingSuffixs = func() []string {
 			var suffixes []string
-			for j := 0; j < int(config.NumberOfShards); j++ {
+			for j := 0; j < numShards; j++ {
 				suffixes = append(suffixes, fmt.Sprintf("_%d", j))
 			}
 			return suffixes
@@ -1949,17 +1953,37 @@ func TestConcurrentConnPoolOperations(t *testing.T) {
 		configs[tableName] = config
 	}
 
-	// Register our middleware with multiple table configs
+	// *** ADD EXPLICIT CONFIG FOR 'orders' TABLE ***
+	// Ensure these settings match the actual expected config for 'orders'
+	configs["orders"] = Config{
+		ShardingKey:    "user_id", // Use the correct sharding key for orders
+		NumberOfShards: 4,         // Use the correct number of shards for orders
+		ShardingSuffixs: func() []string {
+			var suffixes []string
+			for j := 0; j < 4; j++ { // Match NumberOfShards
+				suffixes = append(suffixes, fmt.Sprintf("_%d", j))
+			}
+			return suffixes
+		}, // Removed ()
+		PrimaryKeyGenerator: PKSnowflake, // Use the correct generator for orders
+		DoubleWrite:         false,       // Assuming double write isn't tested for 'orders' here
+	}
+
+	// Register our middleware with multiple table configs (now including 'orders')
 	testMiddleware := Register(configs, &Order{})
-	testDB.Use(testMiddleware)
+	if err := testDB.Use(testMiddleware); err != nil { // Use returned error from Use
+		t.Fatalf("Failed to register middleware: %v", err)
+	}
 
 	// Important: Initialize the database connection properly to set up ConnPool
+	// This AutoMigrate call should now succeed because 'orders' config is present.
 	err = testDB.AutoMigrate(&Order{})
 	if err != nil {
-		t.Fatalf("Failed to migrate: %v", err)
+		t.Fatalf("Failed to migrate Order table: %v", err)
 	}
 
 	// Create the concurrent tables and their sharded versions before testing
+	// (Keep this after AutoMigrate as it might interact with schema)
 	for i := 0; i < 5; i++ {
 		// Create the main table
 		tableName := fmt.Sprintf("concurrent_table_%d", i)
