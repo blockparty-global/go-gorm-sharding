@@ -1652,6 +1652,25 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 		replaceTableNames(n.JoinExpr.Larg, tableMap)
 		replaceTableNames(n.JoinExpr.Rarg, tableMap)
 		replaceTableNames(n.JoinExpr.Quals, tableMap)
+
+		// Also check if the left or right arguments are RangeVar nodes directly
+		if larg, ok := n.JoinExpr.Larg.Node.(*pg_query.Node_RangeVar); ok {
+			if larg.RangeVar.Schemaname == "" {
+				if shardedName, exists := caseInsensitiveTableLookup(tableMap, larg.RangeVar.Relname); exists {
+					larg.RangeVar.Relname = shardedName
+					larg.RangeVar.Location = -1 // Force quoting
+				}
+			}
+		}
+
+		if rarg, ok := n.JoinExpr.Rarg.Node.(*pg_query.Node_RangeVar); ok {
+			if rarg.RangeVar.Schemaname == "" {
+				if shardedName, exists := caseInsensitiveTableLookup(tableMap, rarg.RangeVar.Relname); exists {
+					rarg.RangeVar.Relname = shardedName
+					rarg.RangeVar.Location = -1 // Force quoting
+				}
+			}
+		}
 	case *pg_query.Node_SortBy:
 		replaceTableNames(n.SortBy.Node, tableMap)
 	case *pg_query.Node_ResTarget:
