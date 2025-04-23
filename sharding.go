@@ -825,9 +825,49 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				s.mutex.RLock()
 				cfg, ok := s.configs[fullTableName]
 				s.mutex.RUnlock()
+
+				// Handle JOIN cases with at least one sharding key and double write enabled
+				if err != nil && ok && cfg.DoubleWrite {
+					// Check if this is a JOIN query
+					if isSelect && len(tables) > 1 {
+						// Check if any of the joined tables has a sharding key
+						hasAnyShardingKey := false
+						for _, joinedTable := range tables {
+							if joinedTable == fullTableName {
+								continue // Skip the current table
+							}
+
+							s.mutex.RLock()
+							joinedCfg, joinedOk := s.configs[joinedTable]
+							s.mutex.RUnlock()
+
+							if joinedOk {
+								joinedShardingKey := joinedCfg.ShardingKey
+								_, _, joinedKeyFound, _ := s.extractShardingKeyFromConditions(
+									joinedShardingKey, conditions, args, aliasMap, joinedTable)
+
+								if joinedKeyFound {
+									hasAnyShardingKey = true
+									// We found a sharding key in one of the joined tables
+									// Use the base table for the current table (which doesn't have a sharding key)
+									GetLogger().Debug("JOIN with at least one sharding key found in table %s", joinedTable)
+									break
+								}
+							}
+						}
+
+						// If at least one table in the JOIN has a sharding key, we can proceed with the base table
+						// for the current table that doesn't have a sharding key
+						if hasAnyShardingKey {
+							GetLogger().Debug("Using base table for %s in JOIN with other tables having sharding keys", fullTableName)
+							return ftQuery, stQuery, tableName, nil
+						}
+					}
+				}
+
 				// If this is a SELECT with LOWER function on sharding key and DoubleWrite is enabled,
 				// we need to determine the appropriate sharded table for tables with sharding keys
-				if ok && cfg.DoubleWrite && containsLowerFunction(selectStmt.WhereClause) {
+				if ok && cfg.DoubleWrite && selectStmt != nil && selectStmt.WhereClause != nil && containsLowerFunction(selectStmt.WhereClause) {
 					// Create a map to store known keys for this extraction
 					localKnownKeys := make(map[string]interface{})
 
