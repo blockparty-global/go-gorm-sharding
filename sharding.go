@@ -317,6 +317,12 @@ func (s *Sharding) Initialize(db *gorm.DB) error {
 	s.setDatabaseEngine()
 	s.registerCallbacks(db)
 
+	// Extract the underlying *sql.DB for connection stats logging
+	if sqlDB, err := db.DB(); err == nil {
+		// Configure logger with database connection stats
+		SetLogger(TryWithDBStats(GetLogger(), sqlDB))
+	}
+
 	for t, c := range s.configs {
 		if c.PrimaryKeyGenerator == PKPGSequence {
 			err := s.DB.Exec("CREATE SEQUENCE IF NOT EXISTS " + pgSeqName(t)).Error

@@ -62,8 +62,26 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 
 	// RequestID enables distributed tracing across services for correlating performance issues
 	requestID := uuid.New().String()
-	traceLog("[%s] ExecContext START: Query: %s", requestID, query)
-	defer traceLog("[%s] ExecContext END", requestID)
+
+	// Log connection stats at the start of query execution
+	if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+		stats := sqlDB.Stats()
+		traceLog("[%s] ExecContext START: Query: %s | Connections: open=%d in-use=%d idle=%d",
+			requestID, query, stats.OpenConnections, stats.InUse, stats.Idle)
+	} else {
+		traceLog("[%s] ExecContext START: Query: %s", requestID, query)
+	}
+
+	defer func() {
+		// Log connection stats at the end of query execution
+		if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+			stats := sqlDB.Stats()
+			traceLog("[%s] ExecContext END | Connections: open=%d in-use=%d idle=%d",
+				requestID, stats.OpenConnections, stats.InUse, stats.Idle)
+		} else {
+			traceLog("[%s] ExecContext END", requestID)
+		}
+	}()
 
 	// Try to handle batch insert queries
 	queryCtx := &QueryContext{
@@ -182,8 +200,26 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 	var curTime = time.Now()
 	// RequestID enables tracing query lifecycle across distributed systems
 	requestID := uuid.New().String()
-	traceLog("[%s] QueryContext START: Query: %s", requestID, query)
-	defer traceLog("[%s] QueryContext END", requestID)
+
+	// Log connection stats at the start of query execution
+	if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+		stats := sqlDB.Stats()
+		traceLog("[%s] QueryContext START: Query: %s | Connections: open=%d in-use=%d idle=%d",
+			requestID, query, stats.OpenConnections, stats.InUse, stats.Idle)
+	} else {
+		traceLog("[%s] QueryContext START: Query: %s", requestID, query)
+	}
+
+	defer func() {
+		// Log connection stats at the end of query execution
+		if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+			stats := sqlDB.Stats()
+			traceLog("[%s] QueryContext END | Connections: open=%d in-use=%d idle=%d",
+				requestID, stats.OpenConnections, stats.InUse, stats.Idle)
+		} else {
+			traceLog("[%s] QueryContext END", requestID)
+		}
+	}()
 
 	// Resolving queries outside locks reduces contention in high-throughput scenarios
 	ftQuery, stQuery, table, err := pool.sharding.resolve(query, args...)
@@ -322,8 +358,26 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 
 	// RequestID enables cross-service tracing for performance analysis
 	requestID := uuid.New().String()
-	traceLog("[%s] QueryRowContext START: Query: %s", requestID, query)
-	defer traceLog("[%s] QueryRowContext END", requestID)
+
+	// Log connection stats at the start of query execution
+	if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+		stats := sqlDB.Stats()
+		traceLog("[%s] QueryRowContext START: Query: %s | Connections: open=%d in-use=%d idle=%d",
+			requestID, query, stats.OpenConnections, stats.InUse, stats.Idle)
+	} else {
+		traceLog("[%s] QueryRowContext START: Query: %s", requestID, query)
+	}
+
+	defer func() {
+		// Log connection stats at the end of query execution
+		if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+			stats := sqlDB.Stats()
+			traceLog("[%s] QueryRowContext END | Connections: open=%d in-use=%d idle=%d",
+				requestID, stats.OpenConnections, stats.InUse, stats.Idle)
+		} else {
+			traceLog("[%s] QueryRowContext END", requestID)
+		}
+	}()
 
 	// Non-locked query resolution improves concurrency for high-throughput systems
 	ftQuery, stQuery, table, err := pool.sharding.resolve(query, args...)
