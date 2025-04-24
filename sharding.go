@@ -585,7 +585,8 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 									return ftQuery, stQuery, tableName, nil
 								}
 
-								// Otherwise, allow the query to proceed with double write
+								// Otherwise, allow the query to proceed with double write and add nosharding hint
+								stQuery = fmt.Sprintf("/* nosharding */ %s", query)
 								return ftQuery, stQuery, tableName, nil
 							}
 						}
@@ -819,97 +820,81 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			}
 
 			// Extract sharding key for the current table
-			value, id, keyFound, err := s.extractShardingKeyFromConditions(shardingKey, conditions, args, aliasMap, fullTableName)
-			if err != nil {
-				// Check if DoubleWrite is enabled for this table
-				s.mutex.RLock()
-				cfg, ok := s.configs[fullTableName]
-				s.mutex.RUnlock()
+			value, id, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, aliasMap, fullTableName)
 
-				// Handle JOIN cases with at least one sharding key and double write enabled
-				if err != nil && ok && cfg.DoubleWrite {
-					// Check if this is a JOIN query
-					if isSelect && len(tables) > 1 {
-						// Check if any of the joined tables has a sharding key
-						hasAnyShardingKey := false
-						for _, joinedTable := range tables {
-							if joinedTable == fullTableName {
-								continue // Skip the current table
-							}
+			// Get the config again for DoubleWrite check
+			s.mutex.RLock()
+			cfg, configOk := s.configs[fullTableName]
+			s.mutex.RUnlock()
 
-							s.mutex.RLock()
-							joinedCfg, joinedOk := s.configs[joinedTable]
-							s.mutex.RUnlock()
-
-							if joinedOk {
-								joinedShardingKey := joinedCfg.ShardingKey
-								_, _, joinedKeyFound, _ := s.extractShardingKeyFromConditions(
-									joinedShardingKey, conditions, args, aliasMap, joinedTable)
-
-								if joinedKeyFound {
-									hasAnyShardingKey = true
-									// We found a sharding key in one of the joined tables
-									// Use the base table for the current table (which doesn't have a sharding key)
-									GetLogger().Debug("JOIN with at least one sharding key found in table %s", joinedTable)
-									break
-								}
-							}
+			// Determine suffix and update tableMap
+			if keyFound || (id != 0) { // Sharding key or ID found (even if err != nil, keyFound might be true from LOWER)
+				suffix, suffixErr := getSuffix(value, id, keyFound, cfg)
+				if suffixErr != nil {
+					// If DoubleWrite is enabled, maybe we can proceed with the base table?
+					// Or should it always error if a key was expected but suffix failed?
+					// Let's stick to erroring for now unless DoubleWrite logic dictates otherwise.
+					GetLogger().Error("Error getting suffix for %s: %v. Value: %v, ID: %d, KeyFound: %t", fullTableName, suffixErr, value, id, keyFound)
+					return ftQuery, stQuery, tableName, suffixErr
+				}
+				shardedTableName := originalTableName + suffix
+				tableMapMutex.Lock()
+				tableMap[fullTableName] = shardedTableName // Use fullTableName as key
+				tableMapMutex.Unlock()
+				GetLogger().Debug("Sharding key/ID found for %s. Using sharded table: %s", fullTableName, shardedTableName)
+			} else if configOk && cfg.DoubleWrite {
+				// No sharding key/ID found, but DoubleWrite is enabled.
+				// Check if this is a JOIN and if *other* tables have sharding keys.
+				isJoinQuery := isSelect && len(tables) > 1
+				otherTableHasKey := false
+				if isJoinQuery {
+					for _, joinedTable := range tables {
+						// Ensure joinedTable is not the same as fullTableName before proceeding
+						if joinedTable == fullTableName {
+							continue // Skip self
 						}
 
-						// If at least one table in the JOIN has a sharding key, we can proceed with the base table
-						// for the current table that doesn't have a sharding key
-						if hasAnyShardingKey {
-							GetLogger().Debug("Using base table for %s in JOIN with other tables having sharding keys", fullTableName)
-							return ftQuery, stQuery, tableName, nil
+						s.mutex.RLock()
+						joinedCfg, joinedOk := s.configs[joinedTable]
+						s.mutex.RUnlock()
+
+						if joinedOk {
+							joinedShardingKey := joinedCfg.ShardingKey
+							// Pass the correct aliasMap (which might be nil) to the recursive call
+							_, _, joinedKeyFound, _ := s.extractShardingKeyFromConditions(
+								joinedShardingKey, conditions, args, aliasMap, joinedTable) // Pass joinedTable and aliasMap here
+							if joinedKeyFound {
+								otherTableHasKey = true
+								GetLogger().Debug("Other table %s in JOIN has sharding key.", joinedTable)
+								break
+							}
 						}
 					}
 				}
 
-				// If this is a SELECT with LOWER function on sharding key and DoubleWrite is enabled,
-				// we need to determine the appropriate sharded table for tables with sharding keys
-				if ok && cfg.DoubleWrite && selectStmt != nil && selectStmt.WhereClause != nil && containsLowerFunction(selectStmt.WhereClause) {
-					// Create a map to store known keys for this extraction
-					localKnownKeys := make(map[string]interface{})
-
-					// Extract sharding key value from LOWER function
-					for _, condition := range conditions {
-						if containsLowerFunction(condition) {
-							keyFound, value, err := extractShardingKeyFromLowerFunction(shardingKey, condition, args, localKnownKeys, aliasMap)
-							if keyFound && err == nil && value != nil {
-								// If we found a sharding key in a LOWER function, use it to determine the suffix
-								suffix, err := getSuffix(value, 0, true, r)
-								if err == nil {
-									// Add the sharded table to the tableMap
-									shardedTableName := fullTableName + suffix
-									tableMapMutex.Lock()
-									tableMap[fullTableName] = shardedTableName
-									tableMapMutex.Unlock()
-									GetLogger().Debug("Using sharded table %s for LOWER function on sharding key %s with value %v",
-										shardedTableName, shardingKey, value)
-								}
-							}
-						}
-					}
+				if isJoinQuery && otherTableHasKey {
+					// JOIN query, DoubleWrite enabled, *no key for this table*, but *other tables have keys*.
+					// -> Use the BASE table for this table. Don't add to tableMap.
+					GetLogger().Debug("DoubleWrite enabled for %s, no key found, but other tables in JOIN have keys. Using base table.", fullTableName)
+				} else {
+					// Not a JOIN, or no other tables have keys.
+					// With DoubleWrite, default to the base table if no key is found.
+					// So, don't add to tableMap.
+					GetLogger().Debug("DoubleWrite enabled for %s, no key found. Using base table.", fullTableName)
+					// If strict sharding is needed even with DoubleWrite, uncomment the error:
+					// return ftQuery, stQuery, tableName, ErrMissingShardingKey
 				}
-				return ftQuery, stQuery, tableName, err
+			} else {
+				// No sharding key/ID found, and DoubleWrite is NOT enabled (or config not found).
+				// This is an error condition unless it's a system query or explicitly ignored.
+				// The initial checks for system queries should handle those cases.
+				GetLogger().Error("Missing sharding key for table %s and DoubleWrite is not enabled or config not found. Query: %s", fullTableName, query)
+				return ftQuery, stQuery, tableName, ErrMissingShardingKey
 			}
-
-			// Determine the suffix based on the sharding key
-			suffix, err = getSuffix(value, id, keyFound, r)
-			if err != nil {
-				return ftQuery, stQuery, tableName, err
-			}
-
-			shardedTableName := originalTableName + suffix
-
-			// Thread-safely update the tableMap
-			tableMapMutex.Lock()
-			tableMap[originalTableName] = shardedTableName
-			tableMapMutex.Unlock()
 		}
 	}
 
-	// Traverse the AST and replace original table names with sharded table names
+	// Traverse the AST and replace original table names with sharded table names based on tableMap
 	replaceTableNames(stmt.Stmt, tableMap)
 
 	// Deparse the modified AST back to SQL
@@ -934,21 +919,31 @@ func (s *Sharding) extractShardingKeyFromConditions(shardingKey string, conditio
 	}
 
 	// First, check if any condition contains a LOWER function on the sharding key
+	var lowerKeyFound bool // Declare keyFound and value outside the loop
+	var lowerValue interface{}
+	var lowerErr error // Declare error variable outside the loop
 	for _, condition := range conditions {
 		if containsLowerFunction(condition) {
 			// If we find a LOWER function, try to extract the sharding key from it
-			keyFound, value, err = extractShardingKeyFromLowerFunction(shardingKey, condition, args, knownKeys, aliasMap)
-			if keyFound || err != nil {
-				GetLogger().Debug("Found sharding key %s in LOWER function: value=%v", shardingKey, value)
-				return value, id, keyFound, err
+			// Assign results to the variables declared outside the loop
+			lowerKeyFound, lowerValue, lowerErr = extractShardingKeyFromLowerFunction(shardingKey, condition, args, knownKeys, aliasMap)
+			if lowerKeyFound || lowerErr != nil { // Check if key found OR if an error occurred
+				// Break the loop to handle the result after the loop finishes
+				break
 			}
 		}
 	}
+	// Check the result after the first loop completes or breaks
+	if lowerKeyFound || lowerErr != nil {
+		GetLogger().Debug("Found sharding key %s in LOWER function: value=%v, err=%v", shardingKey, lowerValue, lowerErr)
+		err = lowerErr // Assign the error before returning
+		return lowerValue, id, lowerKeyFound, err
+	}
 
-	// Iterate through each condition to find the sharding key
+	// If not found via LOWER(), iterate through conditions normally
 	for _, condition := range conditions {
 		keyFound, value, err = traverseConditionForKey(shardingKey, condition, args, knownKeys, aliasMap)
-		if keyFound || err != nil {
+		if keyFound || err != nil { // If found or error in normal traversal
 			break
 		}
 
@@ -1332,8 +1327,8 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 				return err
 			}
 
-			if idInt64 == 0 {
-				// Generate a new ID if 'id' is zero
+			if idInt64 == 0 || idInt64 < 0 {
+				// Generate a new ID if 'id' is zero or negative (not explicitly set)
 				if r.PrimaryKeyGeneratorFn != nil {
 					generatedID := r.PrimaryKeyGeneratorFn(int64(shardIndex))
 					if generatedID != 0 {
