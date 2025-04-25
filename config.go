@@ -76,11 +76,11 @@ type ShardingConfig struct {
 func DefaultConfig() *ShardingConfig {
 	return &ShardingConfig{
 		Logging: LogConfig{
-			Level:     LogLevelInfo, // Default to Info level for balance of verbosity and performance
-			ShowTime:  true,         // Include timestamps by default
-			Format:    "text",       // Only text format is currently supported
-			Output:    "stdout",     // Default to stdout for easy visibility
-			UseLogrum: false,        // Use standard logger by default
+			Level:     LogLevelError, // Changed from LogLevelInfo to LogLevelError (0)
+			ShowTime:  false,         // Changed from true to false
+			Format:    "text",        // Only text format is currently supported
+			Output:    "stdout",      // Default to stdout for easy visibility
+			UseLogrum: false,         // Use standard logger by default
 			LogrumOptions: LogrumOptions{
 				AppName:         "gorm-sharding",
 				IncludeCaller:   false,
@@ -88,9 +88,9 @@ func DefaultConfig() *ShardingConfig {
 			},
 		},
 		Connection: ConnectionConfig{
-			MaxLifetime:         3600, // 1 hour default
-			TransactionTimeout:  300,  // 5 minutes default
-			HealthCheckInterval: 60,   // 1 minute default
+			MaxLifetime:         3,  // Changed from 3600 to 3
+			TransactionTimeout:  3,  // Changed from 300 to 3
+			HealthCheckInterval: 60, // 1 minute default
 			MaxRetries:          3,
 			EnableAutoCleanup:   true,
 		},
@@ -223,8 +223,8 @@ func validateConfig(config *ShardingConfig) error {
 	if config.Connection.MaxLifetime < 0 {
 		return fmt.Errorf("invalid max_lifetime: %d (must be >= 0)", config.Connection.MaxLifetime)
 	}
-	if config.Connection.TransactionTimeout <= 0 {
-		return fmt.Errorf("invalid transaction_timeout: %d (must be > 0)", config.Connection.TransactionTimeout)
+	if config.Connection.TransactionTimeout < 0 {
+		return fmt.Errorf("invalid transaction_timeout: %d (must be >= 0)", config.Connection.TransactionTimeout)
 	}
 	if config.Connection.HealthCheckInterval <= 0 {
 		return fmt.Errorf("invalid health_check_interval: %d (must be > 0)", config.Connection.HealthCheckInterval)

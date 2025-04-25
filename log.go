@@ -14,7 +14,7 @@ const (
 )
 
 var (
-	DefaultLogLevel = LogLevelInfo
+	DefaultLogLevel = LogLevelError
 	ErrNotSupported = errors.New("operation not supported by underlying connection pool")
 )
 

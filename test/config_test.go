@@ -25,8 +25,8 @@ func TestDefaultConfig(t *testing.T) {
 	config := sharding.DefaultConfig()
 
 	// Verify default values
-	assert.Equal(t, sharding.LogLevelInfo, config.Logging.Level)
-	assert.True(t, config.Logging.ShowTime)
+	assert.Equal(t, sharding.LogLevelError, config.Logging.Level)
+	assert.False(t, config.Logging.ShowTime)
 	assert.Equal(t, "text", config.Logging.Format)
 	assert.Equal(t, "stdout", config.Logging.Output)
 }
@@ -108,5 +108,5 @@ func TestLoadNonExistentFile(t *testing.T) {
 
 	// Verify default values were used
 	config := sharding.GetConfig()
-	assert.Equal(t, sharding.LogLevelInfo, config.Logging.Level)
+	assert.Equal(t, sharding.LogLevelError, config.Logging.Level)
 }

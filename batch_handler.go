@@ -223,6 +223,14 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		return nil, nil, ErrSkipBatchHandler
 	}
 
+	// Skip batch handling for ON CONFLICT statements
+	if strings.Contains(strings.ToUpper(query), "ON CONFLICT") {
+		if DefaultLogLevel >= LogLevelDebug {
+			debugLog("Skipping batch handling for query with ON CONFLICT clause")
+		}
+		return nil, nil, ErrSkipBatchHandler
+	}
+
 	var tableName, columnsStr, valuesStr string
 	var shardingKeyIndex int
 	var conflictClause string
@@ -638,11 +646,14 @@ func (s *Sharding) HandleBatchInsert(ctx *QueryContext, query string, args []int
 	if err != nil {
 		if errors.Is(err, ErrSkipBatchHandler) {
 			// Not a batch insert or not handled, proceed with normal execution
+			if DefaultLogLevel >= LogLevelTrace {
+				traceLog("Skipping batch handler for query: %s", query)
+			}
 			return nil, err
 		}
 
 		if DefaultLogLevel >= LogLevelDebug {
-			debugLog("Error splitting batch insert: %v", err)
+			debugLog("Error splitting batch insert: %v (query: %s)", err, query)
 		}
 		return nil, err
 	}
