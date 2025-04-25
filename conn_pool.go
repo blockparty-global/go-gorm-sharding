@@ -145,7 +145,9 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 		if doubleWrite {
 			pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
 				result, err = pool.ConnPool.ExecContext(ctx, ftQuery, args...)
-				rowsAffected, _ = result.RowsAffected()
+				if result != nil {
+					rowsAffected, _ = result.RowsAffected()
+				}
 				return pool.sharding.Explain(ftQuery, args...), rowsAffected
 			}, pool.sharding.Error)
 			// Use the original table result as a fallback strategy
@@ -185,7 +187,9 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 	// Sharded query execution comes after main table to ensure at least one copy exists if process crashes
 	result, err = pool.ConnPool.ExecContext(ctx, stQuery, args...)
 	pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
-		rowsAffected, _ = result.RowsAffected()
+		if result != nil {
+			rowsAffected, _ = result.RowsAffected()
+		}
 		return pool.sharding.Explain(stQuery, args...), rowsAffected
 	}, pool.sharding.Error)
 

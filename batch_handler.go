@@ -284,7 +284,7 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 				} else if len(colMatches) > 2 && colMatches[2] != "" {
 					columnName = colMatches[2] // Unquoted format column_name
 				}
-				
+
 				if columnName == config.ShardingKey {
 					shardingKeyIndex = i
 					break
@@ -392,7 +392,7 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		}
 		return nil, nil, ErrSkipBatchHandler
 	}
-	
+
 	// If we have multiple groups (different sharding keys), we need to return ErrInsertDiffSuffix
 	// for tests that expect this error
 	if len(keyValueGroups) > 1 {
@@ -408,24 +408,24 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 
 		// Check if we need to add 'id' column
 		needsID := !strings.Contains(strings.ToLower(columnsStr), "id")
-		
+
 		cols := columnsStr
 		if needsID {
 			cols = columnsStr + ", id"
 		}
-		
+
 		// For each value group, we may need to add the ID
 		valueGroupsWithID := make([]string, len(keyGroup.valueGroups))
 		for i, vg := range keyGroup.valueGroups {
 			if needsID {
 				// Remove surrounding parentheses, add ID, put parentheses back
-				innerValues := vg[1:len(vg)-1]
+				innerValues := vg[1 : len(vg)-1]
 				valueGroupsWithID[i] = "(" + innerValues + ", $sfid)"
 			} else {
 				valueGroupsWithID[i] = vg
 			}
 		}
-		
+
 		// Construct a query for this key value
 		// The test expects quotes around column names for TestInsertManyWithFillID
 		quotedCols := cols
@@ -435,7 +435,7 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 				quotedCols = columnsStr + ", \"id\""
 			}
 		}
-		
+
 		shardQuery := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
 			s.quoteIdent(shardTableName),
 			quotedCols,

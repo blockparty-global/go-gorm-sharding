@@ -1,7 +1,7 @@
 # Sharding configuration
 logging:
   # Log levels: 0=Error, 1=Info, 2=Debug, 3=Trace
-  level: 3
+  level: 0
   show_time: false
   format: text
   # Output options: stdout, stderr, or file path
