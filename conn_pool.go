@@ -16,6 +16,7 @@ import (
 type ConnPool struct {
 	sharding *Sharding
 	gorm.ConnPool
+	txID string // Add transaction ID field to track transactions
 }
 
 // NonTransactionalPool provides a consistent interface across pool types that may not support transactions
@@ -62,8 +63,26 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 
 	// RequestID enables distributed tracing across services for correlating performance issues
 	requestID := uuid.New().String()
-	traceLog("[%s] ExecContext START: Query: %s", requestID, query)
-	defer traceLog("[%s] ExecContext END", requestID)
+
+	// Log connection stats at the start of query execution
+	if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+		stats := sqlDB.Stats()
+		traceLog("[%s] ExecContext START: Query: %s | Connections: open=%d in-use=%d idle=%d",
+			requestID, query, stats.OpenConnections, stats.InUse, stats.Idle)
+	} else {
+		traceLog("[%s] ExecContext START: Query: %s", requestID, query)
+	}
+
+	defer func() {
+		// Log connection stats at the end of query execution
+		if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+			stats := sqlDB.Stats()
+			traceLog("[%s] ExecContext END | Connections: open=%d in-use=%d idle=%d",
+				requestID, stats.OpenConnections, stats.InUse, stats.Idle)
+		} else {
+			traceLog("[%s] ExecContext END", requestID)
+		}
+	}()
 
 	// Try to handle batch insert queries
 	queryCtx := &QueryContext{
@@ -126,7 +145,9 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 		if doubleWrite {
 			pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
 				result, err = pool.ConnPool.ExecContext(ctx, ftQuery, args...)
-				rowsAffected, _ = result.RowsAffected()
+				if result != nil {
+					rowsAffected, _ = result.RowsAffected()
+				}
 				return pool.sharding.Explain(ftQuery, args...), rowsAffected
 			}, pool.sharding.Error)
 			// Use the original table result as a fallback strategy
@@ -166,7 +187,9 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 	// Sharded query execution comes after main table to ensure at least one copy exists if process crashes
 	result, err = pool.ConnPool.ExecContext(ctx, stQuery, args...)
 	pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
-		rowsAffected, _ = result.RowsAffected()
+		if result != nil {
+			rowsAffected, _ = result.RowsAffected()
+		}
 		return pool.sharding.Explain(stQuery, args...), rowsAffected
 	}, pool.sharding.Error)
 
@@ -182,8 +205,26 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 	var curTime = time.Now()
 	// RequestID enables tracing query lifecycle across distributed systems
 	requestID := uuid.New().String()
-	traceLog("[%s] QueryContext START: Query: %s", requestID, query)
-	defer traceLog("[%s] QueryContext END", requestID)
+
+	// Log connection stats at the start of query execution
+	if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+		stats := sqlDB.Stats()
+		traceLog("[%s] QueryContext START: Query: %s | Connections: open=%d in-use=%d idle=%d",
+			requestID, query, stats.OpenConnections, stats.InUse, stats.Idle)
+	} else {
+		traceLog("[%s] QueryContext START: Query: %s", requestID, query)
+	}
+
+	defer func() {
+		// Log connection stats at the end of query execution
+		if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+			stats := sqlDB.Stats()
+			traceLog("[%s] QueryContext END | Connections: open=%d in-use=%d idle=%d",
+				requestID, stats.OpenConnections, stats.InUse, stats.Idle)
+		} else {
+			traceLog("[%s] QueryContext END", requestID)
+		}
+	}()
 
 	// Resolving queries outside locks reduces contention in high-throughput scenarios
 	ftQuery, stQuery, table, err := pool.sharding.resolve(query, args...)
@@ -322,8 +363,26 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 
 	// RequestID enables cross-service tracing for performance analysis
 	requestID := uuid.New().String()
-	traceLog("[%s] QueryRowContext START: Query: %s", requestID, query)
-	defer traceLog("[%s] QueryRowContext END", requestID)
+
+	// Log connection stats at the start of query execution
+	if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+		stats := sqlDB.Stats()
+		traceLog("[%s] QueryRowContext START: Query: %s | Connections: open=%d in-use=%d idle=%d",
+			requestID, query, stats.OpenConnections, stats.InUse, stats.Idle)
+	} else {
+		traceLog("[%s] QueryRowContext START: Query: %s", requestID, query)
+	}
+
+	defer func() {
+		// Log connection stats at the end of query execution
+		if sqlDB, err := pool.sharding.DB.DB(); err == nil {
+			stats := sqlDB.Stats()
+			traceLog("[%s] QueryRowContext END | Connections: open=%d in-use=%d idle=%d",
+				requestID, stats.OpenConnections, stats.InUse, stats.Idle)
+		} else {
+			traceLog("[%s] QueryRowContext END", requestID)
+		}
+	}()
 
 	// Non-locked query resolution improves concurrency for high-throughput systems
 	ftQuery, stQuery, table, err := pool.sharding.resolve(query, args...)
@@ -379,18 +438,28 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 
 // BeginTx uses composition to provide consistent client interface regardless of backend capabilities
 func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.ConnPool, error) {
+	// Get transaction timeout from global configuration
+	txTimeout := time.Duration(GetConfig().Connection.TransactionTimeout) * time.Second
+
+	// Register the transaction in the registry
+	txID, txCtx, _ := pool.sharding.txRegistry.Register(ctx, txTimeout)
+
 	if db, ok := pool.ConnPool.(interface {
 		Get(string) (interface{}, bool)
 	}); ok {
 		if val, ok := db.Get("supports_transactions"); ok && val.(bool) {
 			if basePool, ok := pool.ConnPool.(gorm.ConnPoolBeginner); ok {
-				txConn, err := basePool.BeginTx(ctx, opt)
+				// Use the context with timeout from the registry
+				txConn, err := basePool.BeginTx(txCtx, opt)
 				if err != nil {
+					// Unregister on failure
+					pool.sharding.txRegistry.Unregister(txID)
 					return nil, fmt.Errorf("forced transaction failed: %w", err)
 				}
 				return &ConnPool{
 					sharding: pool.sharding,
 					ConnPool: txConn,
+					txID:     txID, // Store the transaction ID
 				}, nil
 			}
 		}
@@ -398,8 +467,11 @@ func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.Con
 
 	// Try standard transaction support
 	if basePool, ok := pool.ConnPool.(gorm.ConnPoolBeginner); ok {
-		txConn, err := basePool.BeginTx(ctx, opt)
+		// Use the context with timeout from the registry
+		txConn, err := basePool.BeginTx(txCtx, opt)
 		if err != nil {
+			// Unregister on failure
+			pool.sharding.txRegistry.Unregister(txID)
 			return nil, fmt.Errorf("failed to begin transaction: %w", err)
 		}
 
@@ -407,6 +479,7 @@ func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.Con
 		return &ConnPool{
 			sharding: pool.sharding,
 			ConnPool: txConn,
+			txID:     txID, // Store the transaction ID
 		}, nil
 	}
 
@@ -417,50 +490,62 @@ func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.Con
 		ConnPool: &NonTransactionalPool{
 			ConnPool: pool.ConnPool,
 		},
+		txID: txID, // Store the transaction ID even for non-transactional pools
 	}, nil
 }
 
 // Commit uses type assertions to support multiple transaction implementations for maximum compatibility
 func (pool *ConnPool) Commit() error {
+	var err error
+
 	// Handle no-op commits first for pools without transaction support
 	if nonTxPool, ok := pool.ConnPool.(*NonTransactionalPool); ok {
-		return nonTxPool.Commit()
+		err = nonTxPool.Commit()
+	} else if tx, ok := pool.ConnPool.(*sql.Tx); ok {
+		// Support standard SQL transactions
+		err = tx.Commit()
+	} else if basePool, ok := pool.ConnPool.(gorm.TxCommitter); ok {
+		// Finally try GORM-specific transaction handling
+		err = basePool.Commit()
+	} else {
+		// Clear error for unsupported operations prevents silent failures
+		err = ErrNotSupported
 	}
 
-	// Support standard SQL transactions for broad compatibility
-	tx, ok := pool.ConnPool.(*sql.Tx)
-	if ok {
-		return tx.Commit()
+	// Unregister the transaction regardless of the commit result
+	// This ensures cleanup even if the commit fails
+	if pool.txID != "" {
+		pool.sharding.txRegistry.Unregister(pool.txID)
+		pool.txID = "" // Clear the ID to prevent double cleanup
 	}
 
-	// Finally try GORM-specific transaction handling
-	if basePool, ok := pool.ConnPool.(gorm.TxCommitter); ok {
-		return basePool.Commit()
-	}
-
-	// Clear error for unsupported operations prevents silent failures
-	return ErrNotSupported
+	return err
 }
 
 // Rollback follows same pattern as Commit to handle multiple transaction types
 func (pool *ConnPool) Rollback() error {
+	var err error
+
 	// Handle our wrapper first for consistent interface
 	if nonTxPool, ok := pool.ConnPool.(*NonTransactionalPool); ok {
-		return nonTxPool.Rollback()
+		err = nonTxPool.Rollback()
+	} else if tx, ok := pool.ConnPool.(*sql.Tx); ok {
+		// Support standard SQL transactions directly
+		err = tx.Rollback()
+	} else if basePool, ok := pool.ConnPool.(gorm.TxCommitter); ok {
+		// Try GORM-specific transaction handling
+		err = basePool.Rollback()
+	} else {
+		err = ErrNotSupported
 	}
 
-	// Support standard SQL transactions directly
-	tx, ok := pool.ConnPool.(*sql.Tx)
-	if ok {
-		return tx.Rollback()
+	// Unregister the transaction regardless of the rollback result
+	if pool.txID != "" {
+		pool.sharding.txRegistry.Unregister(pool.txID)
+		pool.txID = "" // Clear the ID to prevent double cleanup
 	}
 
-	// Try GORM-specific transaction handling
-	if basePool, ok := pool.ConnPool.(gorm.TxCommitter); ok {
-		return basePool.Rollback()
-	}
-
-	return ErrNotSupported
+	return err
 }
 
 // Ping uses progressively more generic approaches for reliable health checks across database types

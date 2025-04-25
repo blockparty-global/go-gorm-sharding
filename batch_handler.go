@@ -223,6 +223,14 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		return nil, nil, ErrSkipBatchHandler
 	}
 
+	// Skip batch handling for ON CONFLICT statements
+	if strings.Contains(strings.ToUpper(query), "ON CONFLICT") {
+		if DefaultLogLevel >= LogLevelDebug {
+			debugLog("Skipping batch handling for query with ON CONFLICT clause")
+		}
+		return nil, nil, ErrSkipBatchHandler
+	}
+
 	var tableName, columnsStr, valuesStr string
 	var shardingKeyIndex int
 	var conflictClause string
@@ -284,7 +292,7 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 				} else if len(colMatches) > 2 && colMatches[2] != "" {
 					columnName = colMatches[2] // Unquoted format column_name
 				}
-				
+
 				if columnName == config.ShardingKey {
 					shardingKeyIndex = i
 					break
@@ -392,7 +400,7 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		}
 		return nil, nil, ErrSkipBatchHandler
 	}
-	
+
 	// If we have multiple groups (different sharding keys), we need to return ErrInsertDiffSuffix
 	// for tests that expect this error
 	if len(keyValueGroups) > 1 {
@@ -408,24 +416,24 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 
 		// Check if we need to add 'id' column
 		needsID := !strings.Contains(strings.ToLower(columnsStr), "id")
-		
+
 		cols := columnsStr
 		if needsID {
 			cols = columnsStr + ", id"
 		}
-		
+
 		// For each value group, we may need to add the ID
 		valueGroupsWithID := make([]string, len(keyGroup.valueGroups))
 		for i, vg := range keyGroup.valueGroups {
 			if needsID {
 				// Remove surrounding parentheses, add ID, put parentheses back
-				innerValues := vg[1:len(vg)-1]
+				innerValues := vg[1 : len(vg)-1]
 				valueGroupsWithID[i] = "(" + innerValues + ", $sfid)"
 			} else {
 				valueGroupsWithID[i] = vg
 			}
 		}
-		
+
 		// Construct a query for this key value
 		// The test expects quotes around column names for TestInsertManyWithFillID
 		quotedCols := cols
@@ -435,7 +443,7 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 				quotedCols = columnsStr + ", \"id\""
 			}
 		}
-		
+
 		shardQuery := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
 			s.quoteIdent(shardTableName),
 			quotedCols,
@@ -638,11 +646,14 @@ func (s *Sharding) HandleBatchInsert(ctx *QueryContext, query string, args []int
 	if err != nil {
 		if errors.Is(err, ErrSkipBatchHandler) {
 			// Not a batch insert or not handled, proceed with normal execution
+			if DefaultLogLevel >= LogLevelTrace {
+				traceLog("Skipping batch handler for query: %s", query)
+			}
 			return nil, err
 		}
 
 		if DefaultLogLevel >= LogLevelDebug {
-			debugLog("Error splitting batch insert: %v", err)
+			debugLog("Error splitting batch insert: %v (query: %s)", err, query)
 		}
 		return nil, err
 	}

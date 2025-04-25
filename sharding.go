@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/snowflake"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
@@ -45,6 +46,8 @@ type Sharding struct {
 	snowflakeNodes []*snowflake.Node
 	globalIndices  *GlobalIndexRegistry
 	queryRewriter  *QueryRewriter
+	txRegistry     *TransactionRegistry     // Add transaction registry
+	healthChecker  *ConnectionHealthChecker // Add health checker
 
 	_config Config
 	_tables []any
@@ -316,6 +319,28 @@ func (s *Sharding) Initialize(db *gorm.DB) error {
 	s.DB = db
 	s.setDatabaseEngine()
 	s.registerCallbacks(db)
+
+	// Initialize transaction registry
+	s.txRegistry = NewTransactionRegistry()
+
+	// Initialize and start health checker if enabled
+	if GetConfig().Connection.EnableAutoCleanup {
+		interval := time.Duration(GetConfig().Connection.HealthCheckInterval) * time.Second
+		s.healthChecker = NewConnectionHealthChecker(s, interval)
+		s.healthChecker.Start()
+	}
+
+	// Extract the underlying *sql.DB for connection stats logging
+	if sqlDB, err := db.DB(); err == nil {
+		// Configure logger with database connection stats
+		SetLogger(TryWithDBStats(GetLogger(), sqlDB))
+
+		// Configure database timeouts
+		if err := s.ConfigureDatabaseTimeouts(sqlDB); err != nil {
+			// Log the error but don't fail initialization
+			errorLog("Warning: Failed to configure database timeouts: %v", err)
+		}
+	}
 
 	for t, c := range s.configs {
 		if c.PrimaryKeyGenerator == PKPGSequence {
@@ -2757,4 +2782,14 @@ func (s *Sharding) handleMultiShardInsert(db *gorm.DB) error {
 	// Skip the default processing since we've handled it
 	db.SkipDefaultTransaction = true
 	return nil
+}
+
+// Close performs cleanup when shutting down the sharding system.
+func (s *Sharding) Close() {
+	// Stop the health checker if it's running
+	if s.healthChecker != nil {
+		s.healthChecker.Stop()
+	}
+
+	// Other cleanup tasks can be added here in the future
 }

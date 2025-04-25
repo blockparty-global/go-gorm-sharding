@@ -1,6 +1,7 @@
 package sharding
 
 import (
+	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -32,11 +33,19 @@ type Logger interface {
 	GetLevel() LogLevel
 }
 
+// DBStatsLogger extends Logger with connection stats tracking capability
+type DBStatsLogger interface {
+	Logger
+	// WithDBStats adds database connection statistics to log entries
+	WithDBStats(db *sql.DB) Logger
+}
+
 // StandardLogger implements the Logger interface using Go's standard log package
 type StandardLogger struct {
 	mutex sync.RWMutex
 	level LogLevel
 	log   *log.Logger
+	db    *sql.DB
 }
 
 // NewStandardLogger creates a new StandardLogger with the specified level and output
@@ -52,8 +61,29 @@ func NewStandardLogger(level LogLevel, out io.Writer, showTime bool) *StandardLo
 	}
 }
 
+// WithDBStats adds database connection tracking to the logger
+func (l *StandardLogger) WithDBStats(db *sql.DB) Logger {
+	l.db = db
+	return l
+}
+
+// getConnectionStats returns connection statistics if DB is available
+func (l *StandardLogger) getConnectionStats() string {
+	if l.db == nil {
+		return ""
+	}
+
+	stats := l.db.Stats()
+	return fmt.Sprintf("[Connections: open=%d in-use=%d idle=%d]",
+		stats.OpenConnections, stats.InUse, stats.Idle)
+}
+
 // Error logs error messages
 func (l *StandardLogger) Error(format string, args ...interface{}) {
+	connStats := l.getConnectionStats()
+	if connStats != "" {
+		format = connStats + " " + format
+	}
 	l.log.Printf("[ERROR] "+format, args...)
 }
 
@@ -63,6 +93,10 @@ func (l *StandardLogger) Info(format string, args ...interface{}) {
 	defer l.mutex.RUnlock()
 
 	if l.level >= LogLevelInfo {
+		connStats := l.getConnectionStats()
+		if connStats != "" {
+			format = connStats + " " + format
+		}
 		l.log.Printf("[INFO] "+format, args...)
 	}
 }
@@ -73,6 +107,10 @@ func (l *StandardLogger) Debug(format string, args ...interface{}) {
 	defer l.mutex.RUnlock()
 
 	if l.level >= LogLevelDebug {
+		connStats := l.getConnectionStats()
+		if connStats != "" {
+			format = connStats + " " + format
+		}
 		l.log.Printf("[DEBUG] "+format, args...)
 	}
 }
@@ -83,6 +121,10 @@ func (l *StandardLogger) Trace(format string, args ...interface{}) {
 	defer l.mutex.RUnlock()
 
 	if l.level >= LogLevelTrace {
+		connStats := l.getConnectionStats()
+		if connStats != "" {
+			format = connStats + " " + format
+		}
 		l.log.Printf("[TRACE] "+format, args...)
 	}
 }
@@ -122,6 +164,25 @@ type LogrumLogger struct {
 	logrus       *logrus.Logger
 	appName      string
 	mockProvider MockLogrusProvider // Used for testing
+	db           *sql.DB
+}
+
+// WithDBStats adds database connection tracking to the logger
+func (l *LogrumLogger) WithDBStats(db *sql.DB) Logger {
+	l.db = db
+	return l
+}
+
+// getConnectionStats returns connection statistics if DB is available
+func (l *LogrumLogger) getConnectionStats() logrus.Fields {
+	fields := logrus.Fields{}
+	if l.db != nil {
+		stats := l.db.Stats()
+		fields["connections_open"] = stats.OpenConnections
+		fields["connections_in_use"] = stats.InUse
+		fields["connections_idle"] = stats.Idle
+	}
+	return fields
 }
 
 // NewLogrumLogger creates a new LogrumLogger with default settings
@@ -167,6 +228,11 @@ func (l *LogrumLogger) Error(format string, args ...interface{}) {
 		fields["app"] = l.appName
 	}
 
+	// Add connection stats
+	for k, v := range l.getConnectionStats() {
+		fields[k] = v
+	}
+
 	l.logrus.WithFields(fields).Error(message)
 }
 
@@ -190,6 +256,11 @@ func (l *LogrumLogger) Info(format string, args ...interface{}) {
 		fields := logrus.Fields{}
 		if l.appName != "" {
 			fields["app"] = l.appName
+		}
+
+		// Add connection stats
+		for k, v := range l.getConnectionStats() {
+			fields[k] = v
 		}
 
 		l.logrus.WithFields(fields).Info(message)
@@ -218,6 +289,11 @@ func (l *LogrumLogger) Debug(format string, args ...interface{}) {
 			fields["app"] = l.appName
 		}
 
+		// Add connection stats
+		for k, v := range l.getConnectionStats() {
+			fields[k] = v
+		}
+
 		l.logrus.WithFields(fields).Debug(message)
 	}
 }
@@ -242,6 +318,11 @@ func (l *LogrumLogger) Trace(format string, args ...interface{}) {
 		fields := logrus.Fields{}
 		if l.appName != "" {
 			fields["app"] = l.appName
+		}
+
+		// Add connection stats
+		for k, v := range l.getConnectionStats() {
+			fields[k] = v
 		}
 
 		l.logrus.WithFields(fields).Trace(message)
@@ -321,6 +402,15 @@ func SetLogger(logger Logger) {
 	defer loggerMutex.Unlock()
 
 	defaultLogger = logger
+}
+
+// TryWithDBStats attempts to configure a logger with database stats if it supports it
+// Returns the original logger if WithDBStats is not supported
+func TryWithDBStats(logger Logger, db *sql.DB) Logger {
+	if dbLogger, ok := logger.(DBStatsLogger); ok {
+		return dbLogger.WithDBStats(db)
+	}
+	return logger
 }
 
 // configureStandardLogger configures the default logger based on configuration
