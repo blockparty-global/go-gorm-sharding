@@ -16,6 +16,7 @@ import (
 type ConnPool struct {
 	sharding *Sharding
 	gorm.ConnPool
+	txID string // Add transaction ID field to track transactions
 }
 
 // NonTransactionalPool provides a consistent interface across pool types that may not support transactions
@@ -433,18 +434,28 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 
 // BeginTx uses composition to provide consistent client interface regardless of backend capabilities
 func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.ConnPool, error) {
+	// Get transaction timeout from global configuration
+	txTimeout := time.Duration(GetConfig().Connection.TransactionTimeout) * time.Second
+
+	// Register the transaction in the registry
+	txID, txCtx, _ := pool.sharding.txRegistry.Register(ctx, txTimeout)
+
 	if db, ok := pool.ConnPool.(interface {
 		Get(string) (interface{}, bool)
 	}); ok {
 		if val, ok := db.Get("supports_transactions"); ok && val.(bool) {
 			if basePool, ok := pool.ConnPool.(gorm.ConnPoolBeginner); ok {
-				txConn, err := basePool.BeginTx(ctx, opt)
+				// Use the context with timeout from the registry
+				txConn, err := basePool.BeginTx(txCtx, opt)
 				if err != nil {
+					// Unregister on failure
+					pool.sharding.txRegistry.Unregister(txID)
 					return nil, fmt.Errorf("forced transaction failed: %w", err)
 				}
 				return &ConnPool{
 					sharding: pool.sharding,
 					ConnPool: txConn,
+					txID:     txID, // Store the transaction ID
 				}, nil
 			}
 		}
@@ -452,8 +463,11 @@ func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.Con
 
 	// Try standard transaction support
 	if basePool, ok := pool.ConnPool.(gorm.ConnPoolBeginner); ok {
-		txConn, err := basePool.BeginTx(ctx, opt)
+		// Use the context with timeout from the registry
+		txConn, err := basePool.BeginTx(txCtx, opt)
 		if err != nil {
+			// Unregister on failure
+			pool.sharding.txRegistry.Unregister(txID)
 			return nil, fmt.Errorf("failed to begin transaction: %w", err)
 		}
 
@@ -461,6 +475,7 @@ func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.Con
 		return &ConnPool{
 			sharding: pool.sharding,
 			ConnPool: txConn,
+			txID:     txID, // Store the transaction ID
 		}, nil
 	}
 
@@ -471,50 +486,62 @@ func (pool *ConnPool) BeginTx(ctx context.Context, opt *sql.TxOptions) (gorm.Con
 		ConnPool: &NonTransactionalPool{
 			ConnPool: pool.ConnPool,
 		},
+		txID: txID, // Store the transaction ID even for non-transactional pools
 	}, nil
 }
 
 // Commit uses type assertions to support multiple transaction implementations for maximum compatibility
 func (pool *ConnPool) Commit() error {
+	var err error
+
 	// Handle no-op commits first for pools without transaction support
 	if nonTxPool, ok := pool.ConnPool.(*NonTransactionalPool); ok {
-		return nonTxPool.Commit()
+		err = nonTxPool.Commit()
+	} else if tx, ok := pool.ConnPool.(*sql.Tx); ok {
+		// Support standard SQL transactions
+		err = tx.Commit()
+	} else if basePool, ok := pool.ConnPool.(gorm.TxCommitter); ok {
+		// Finally try GORM-specific transaction handling
+		err = basePool.Commit()
+	} else {
+		// Clear error for unsupported operations prevents silent failures
+		err = ErrNotSupported
 	}
 
-	// Support standard SQL transactions for broad compatibility
-	tx, ok := pool.ConnPool.(*sql.Tx)
-	if ok {
-		return tx.Commit()
+	// Unregister the transaction regardless of the commit result
+	// This ensures cleanup even if the commit fails
+	if pool.txID != "" {
+		pool.sharding.txRegistry.Unregister(pool.txID)
+		pool.txID = "" // Clear the ID to prevent double cleanup
 	}
 
-	// Finally try GORM-specific transaction handling
-	if basePool, ok := pool.ConnPool.(gorm.TxCommitter); ok {
-		return basePool.Commit()
-	}
-
-	// Clear error for unsupported operations prevents silent failures
-	return ErrNotSupported
+	return err
 }
 
 // Rollback follows same pattern as Commit to handle multiple transaction types
 func (pool *ConnPool) Rollback() error {
+	var err error
+
 	// Handle our wrapper first for consistent interface
 	if nonTxPool, ok := pool.ConnPool.(*NonTransactionalPool); ok {
-		return nonTxPool.Rollback()
+		err = nonTxPool.Rollback()
+	} else if tx, ok := pool.ConnPool.(*sql.Tx); ok {
+		// Support standard SQL transactions directly
+		err = tx.Rollback()
+	} else if basePool, ok := pool.ConnPool.(gorm.TxCommitter); ok {
+		// Try GORM-specific transaction handling
+		err = basePool.Rollback()
+	} else {
+		err = ErrNotSupported
 	}
 
-	// Support standard SQL transactions directly
-	tx, ok := pool.ConnPool.(*sql.Tx)
-	if ok {
-		return tx.Rollback()
+	// Unregister the transaction regardless of the rollback result
+	if pool.txID != "" {
+		pool.sharding.txRegistry.Unregister(pool.txID)
+		pool.txID = "" // Clear the ID to prevent double cleanup
 	}
 
-	// Try GORM-specific transaction handling
-	if basePool, ok := pool.ConnPool.(gorm.TxCommitter); ok {
-		return basePool.Rollback()
-	}
-
-	return ErrNotSupported
+	return err
 }
 
 // Ping uses progressively more generic approaches for reliable health checks across database types

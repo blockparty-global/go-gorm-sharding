@@ -44,10 +44,31 @@ type LogrumOptions struct {
 	TimestampFormat string `yaml:"timestamp_format"`
 }
 
+// ConnectionConfig holds configuration options for database connections.
+type ConnectionConfig struct {
+	// Maximum lifetime of a connection in the pool (in seconds)
+	MaxLifetime int `yaml:"max_lifetime"`
+
+	// Default transaction timeout (in seconds)
+	TransactionTimeout int `yaml:"transaction_timeout"`
+
+	// Health check interval (in seconds)
+	HealthCheckInterval int `yaml:"health_check_interval"`
+
+	// Maximum number of retries for operations
+	MaxRetries int `yaml:"max_retries"`
+
+	// Whether to enable automatic transaction cleanup
+	EnableAutoCleanup bool `yaml:"enable_auto_cleanup"`
+}
+
 // ShardingConfig holds all configuration settings for the sharding package.
 type ShardingConfig struct {
 	// Logging contains all logging-related configuration
 	Logging LogConfig `yaml:"logging"`
+
+	// Connection contains all connection-related configuration
+	Connection ConnectionConfig `yaml:"connection"`
 }
 
 // DefaultConfig provides sensible defaults for all settings.
@@ -65,6 +86,13 @@ func DefaultConfig() *ShardingConfig {
 				IncludeCaller:   false,
 				TimestampFormat: "2006-01-02T15:04:05.000Z07:00",
 			},
+		},
+		Connection: ConnectionConfig{
+			MaxLifetime:         3600, // 1 hour default
+			TransactionTimeout:  300,  // 5 minutes default
+			HealthCheckInterval: 60,   // 1 minute default
+			MaxRetries:          3,
+			EnableAutoCleanup:   true,
 		},
 	}
 }
@@ -191,7 +219,26 @@ func validateConfig(config *ShardingConfig) error {
 		f.Close()
 	}
 
+	// Validate connection configuration
+	if config.Connection.MaxLifetime < 0 {
+		return fmt.Errorf("invalid max_lifetime: %d (must be >= 0)", config.Connection.MaxLifetime)
+	}
+	if config.Connection.TransactionTimeout <= 0 {
+		return fmt.Errorf("invalid transaction_timeout: %d (must be > 0)", config.Connection.TransactionTimeout)
+	}
+	if config.Connection.HealthCheckInterval <= 0 {
+		return fmt.Errorf("invalid health_check_interval: %d (must be > 0)", config.Connection.HealthCheckInterval)
+	}
+	if config.Connection.MaxRetries < 0 {
+		return fmt.Errorf("invalid max_retries: %d (must be >= 0)", config.Connection.MaxRetries)
+	}
+
 	return nil
+}
+
+// ValidateConfig is a public wrapper for validateConfig to be used in tests
+func ValidateConfig(config *ShardingConfig) error {
+	return validateConfig(config)
 }
 
 // GetConfig returns the current configuration.

@@ -6,3 +6,16 @@ logging:
   format: text
   # Output options: stdout, stderr, or file path
   output: stdout 
+
+# Connection configuration
+connection:
+  # Maximum lifetime of a connection in the pool (in seconds)
+  max_lifetime: 3
+  # Default transaction timeout (in seconds)
+  transaction_timeout: 3
+  # Health check interval (in seconds)
+  health_check_interval: 60
+  # Maximum number of retries for operations
+  max_retries: 3
+  # Whether to enable automatic transaction cleanup
+  enable_auto_cleanup: true 
