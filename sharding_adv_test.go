@@ -13,15 +13,28 @@ import (
 )
 
 type TokenWithHashPartition struct {
-	ID             int64  `gorm:"primarykey"`
-	Contract       string `gorm:"index:idx_contract"`
-	TokenID        string `gorm:"index:idx_token_id"`
-	TokenURIStatus string
-	TokenURI       string
-	Name           string
-	Description    string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                  int64  `gorm:"primarykey"`
+	Contract            string `gorm:"index:idx_contract"`
+	TokenID             string `gorm:"index:idx_token_id"`
+	TokenURIStatus      string
+	TokenURI            string
+	Name                string
+	Description         string
+	LastTokenURICheck   *time.Time
+	MetadataStatus      string
+	MetadataContentType string
+	MetadataContent     string
+	MetadataAttempts    int
+	LastMetadataAttempt *time.Time
+	CreatedAt           time.Time
+	CreatedBlock        *int64
+	BurnedAt            *time.Time
+	BurnedBlock         *int64
+	ErrorMsg            string
+	Expired             bool
+	MetadataChecks      int
+	LastMetadataCheck   *time.Time
+	UpdatedAt           time.Time
 }
 
 // ContractWithHashPartition represents a blockchain contract with hash partitioning
@@ -565,5 +578,273 @@ func TestHashPartitioningWithLowerFunction(t *testing.T) {
 	// This is a no-op test to make sure the package is tested correctly
 	t.Run("NoOp", func(t *testing.T) {
 		tassert.True(t, true, "This test should always pass")
+	})
+}
+
+func TestTokenMetadataQueryWithSharding(t *testing.T) {
+	// Create a test DB with proper configuration
+	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
+	})
+	if err != nil {
+		t.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	// Set up hash partitioning with contract as the sharding key for tokens
+	tokenConfig := Config{
+		DoubleWrite:         true,
+		ShardingKey:         "contract", // contract is the sharding key for tokens
+		PartitionType:       PartitionTypeHash,
+		NumberOfShards:      4,
+		ShardingAlgorithm:   shardingHasher4Algorithm,
+		PrimaryKeyGenerator: PKSnowflake,
+		ShardingSuffixs: func() []string {
+			return []string{"_0", "_1", "_2", "_3"}
+		},
+	}
+
+	// Register the middleware with the configuration
+	configs := map[string]Config{
+		"token_with_hash_partitions": tokenConfig,
+	}
+
+	middleware := Register(configs, &TokenWithHashPartition{})
+	testDB.Use(middleware)
+
+	// Drop and recreate tables
+	testDB.Exec("DROP TABLE IF EXISTS token_with_hash_partitions")
+	for i := 0; i < 4; i++ {
+		testDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS token_with_hash_partitions_%d", i))
+	}
+
+	// Auto migrate to create the tables
+	err = testDB.AutoMigrate(&TokenWithHashPartition{})
+	if err != nil {
+		t.Fatalf("Failed to migrate tables: %v", err)
+	}
+
+	// Create sharded tables with all the necessary fields for the metadata query
+	for i := 0; i < 4; i++ {
+		testDB.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS token_with_hash_partitions_%d (
+			id bigint PRIMARY KEY,
+			contract text,
+			token_id text,
+			token_uri_status text,
+			token_uri text,
+			name text,
+			description text,
+			last_token_uri_check timestamp with time zone,
+			metadata_status text,
+			metadata_content_type text,
+			metadata_content text,
+			metadata_attempts integer,
+			last_metadata_attempt timestamp with time zone,
+			created_at timestamp with time zone,
+			created_block bigint,
+			burned_at timestamp with time zone,
+			burned_block bigint,
+			error_msg text,
+			expired boolean,
+			metadata_checks integer,
+			last_metadata_check timestamp with time zone,
+			updated_at timestamp with time zone
+		)`, i))
+	}
+
+	// Insert test tokens with different metadata statuses and timestamps
+	// We'll create tokens that match the query conditions and some that don't
+	now := time.Now()
+	twoWeeksAgo := now.Add(-time.Hour * 24 * 14)
+
+	testTokens := []TokenWithHashPartition{
+		// Token that matches all conditions (should be returned by the query)
+		{
+			Contract:            "0xabc123",
+			TokenID:             "1",
+			TokenURIStatus:      "READY",
+			MetadataStatus:      "PENDING",
+			LastMetadataCheck:   &twoWeeksAgo,
+			LastMetadataAttempt: &twoWeeksAgo,
+			BurnedBlock:         nil, // Not burned
+		},
+		// Token with different metadata status but still matches (should be returned)
+		{
+			Contract:            "0xabc123",
+			TokenID:             "2",
+			TokenURIStatus:      "READY",
+			MetadataStatus:      "FAILED",
+			LastMetadataCheck:   &twoWeeksAgo,
+			LastMetadataAttempt: &twoWeeksAgo,
+			BurnedBlock:         nil, // Not burned
+		},
+		// Token with recent metadata check (should NOT be returned)
+		{
+			Contract:            "0xabc123",
+			TokenID:             "3",
+			TokenURIStatus:      "READY",
+			MetadataStatus:      "PENDING",
+			LastMetadataCheck:   &now, // Too recent
+			LastMetadataAttempt: &twoWeeksAgo,
+			BurnedBlock:         nil, // Not burned
+		},
+		// Token with recent metadata attempt (should NOT be returned)
+		{
+			Contract:            "0xabc123",
+			TokenID:             "4",
+			TokenURIStatus:      "READY",
+			MetadataStatus:      "PENDING",
+			LastMetadataCheck:   &twoWeeksAgo,
+			LastMetadataAttempt: &now, // Too recent
+			BurnedBlock:         nil,  // Not burned
+		},
+		// Token that is burned (should NOT be returned)
+		{
+			Contract:            "0xabc123",
+			TokenID:             "5",
+			TokenURIStatus:      "READY",
+			MetadataStatus:      "PENDING",
+			LastMetadataCheck:   &twoWeeksAgo,
+			LastMetadataAttempt: &twoWeeksAgo,
+			BurnedBlock:         new(int64), // Burned
+		},
+		// Token with wrong token_uri_status (should NOT be returned)
+		{
+			Contract:            "0xabc123",
+			TokenID:             "6",
+			TokenURIStatus:      "FAILED", // Wrong status
+			MetadataStatus:      "PENDING",
+			LastMetadataCheck:   &twoWeeksAgo,
+			LastMetadataAttempt: &twoWeeksAgo,
+			BurnedBlock:         nil, // Not burned
+		},
+		// Token with different contract (for testing sharding key)
+		{
+			Contract:            "0xdef456",
+			TokenID:             "1",
+			TokenURIStatus:      "READY",
+			MetadataStatus:      "PENDING",
+			LastMetadataCheck:   &twoWeeksAgo,
+			LastMetadataAttempt: &twoWeeksAgo,
+			BurnedBlock:         nil, // Not burned
+		},
+	}
+
+	// Insert the test tokens
+	for _, token := range testTokens {
+		err := testDB.Create(&token).Error
+		tassert.NoError(t, err, "Failed to insert token")
+		t.Logf("Created token with contract %s, tokenID %s", token.Contract, token.TokenID)
+	}
+
+	// Test 1: Reproduce the error - Query without specifying the sharding key
+	t.Run("ReproduceError_MissingShardingKey", func(t *testing.T) {
+		var results []TokenWithHashPartition
+
+		// This query should fail because it doesn't specify the contract (sharding key)
+		err := testDB.Model(&TokenWithHashPartition{}).
+			Where("(metadata_status = ? OR metadata_status = ?) AND burned_block IS NULL AND token_uri_status != ?",
+				"PENDING", "FAILED", "FAILED").
+			Where("last_metadata_check IS NOT NULL AND last_metadata_check < NOW() - INTERVAL '10080 minutes'").
+			Where("last_metadata_attempt IS NOT NULL AND last_metadata_attempt < NOW() - INTERVAL '10080 minutes'").
+			Order("last_metadata_check").
+			Limit(10000).
+			Find(&results).Error
+
+		// This should fail with "sharding key or id required, and use operator ="
+		tassert.Error(t, err, "Query should fail with sharding key error")
+		//tassert.Contains(t, err.Error(), "sharding key or id required", "Error should mention sharding key requirement")
+	})
+
+	// Test 2: Fix 1 - Add the sharding key condition
+	t.Run("Fix1_AddShardingKey", func(t *testing.T) {
+		var results []TokenWithHashPartition
+
+		// This query should succeed because it includes the contract (sharding key)
+		err := testDB.Model(&TokenWithHashPartition{}).
+			Where("contract = ?", "0xabc123"). // Add sharding key
+			Where("(metadata_status = ? OR metadata_status = ?) AND burned_block IS NULL AND token_uri_status != ?",
+				"PENDING", "FAILED", "FAILED").
+			Where("last_metadata_check IS NOT NULL AND last_metadata_check < NOW() - INTERVAL '10080 minutes'").
+			Where("last_metadata_attempt IS NOT NULL AND last_metadata_attempt < NOW() - INTERVAL '10080 minutes'").
+			Order("last_metadata_check").
+			Limit(10000).
+			Find(&results).Error
+
+		tassert.NoError(t, err, "Query with sharding key should succeed")
+		tassert.GreaterOrEqual(t, len(results), 2, "Should find at least 2 matching tokens")
+
+		t.Logf("Found %d results with sharding key", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+	})
+
+	// Test 3: Fix 2 - Use nosharding hint for cross-shard queries
+	t.Run("Fix2_UseNoshardingHint", func(t *testing.T) {
+		var results []TokenWithHashPartition
+
+		// This query should succeed because it uses the nosharding hint
+		err := testDB.Model(&TokenWithHashPartition{}).
+			Clauses(hints.New("nosharding")).
+			Where("(metadata_status = ? OR metadata_status = ?) AND burned_block IS NULL AND token_uri_status != ?",
+				"PENDING", "FAILED", "FAILED").
+			Where("last_metadata_check IS NOT NULL AND last_metadata_check < NOW() - INTERVAL '10080 minutes'").
+			Where("last_metadata_attempt IS NOT NULL AND last_metadata_attempt < NOW() - INTERVAL '10080 minutes'").
+			Order("last_metadata_check").
+			Limit(10000).
+			Find(&results).Error
+
+		tassert.NoError(t, err, "Query with nosharding hint should succeed")
+		tassert.GreaterOrEqual(t, len(results), 3, "Should find at least 3 matching tokens across all shards")
+
+		t.Logf("Found %d results with nosharding hint", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+	})
+
+	// Test 4: Fix 3 - Use IN clause for multiple contracts
+	t.Run("Fix3_UseInClauseForMultipleContracts", func(t *testing.T) {
+		var results []TokenWithHashPartition
+
+		// This query should succeed because it uses IN clause for multiple contracts
+		err := testDB.Model(&TokenWithHashPartition{}).
+			Where("contract IN ?", []string{"0xabc123", "0xdef456"}). // Multiple contracts
+			Where("(metadata_status = ? OR metadata_status = ?) AND burned_block IS NULL AND token_uri_status != ?",
+				"PENDING", "FAILED", "FAILED").
+			Where("last_metadata_check IS NOT NULL AND last_metadata_check < NOW() - INTERVAL '10080 minutes'").
+			Where("last_metadata_attempt IS NOT NULL AND last_metadata_attempt < NOW() - INTERVAL '10080 minutes'").
+			Order("last_metadata_check").
+			Limit(10000).
+			Find(&results).Error
+
+		tassert.NoError(t, err, "Query with IN clause should succeed")
+		tassert.GreaterOrEqual(t, len(results), 3, "Should find at least 3 matching tokens")
+
+		t.Logf("Found %d results with IN clause", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+	})
+
+	// Test 5: Fix 4 - Use separate queries per contract and combine results
+	t.Run("Fix4_SeparateQueriesPerContract", func(t *testing.T) {
+		var allResults []TokenWithHashPartition
+		contracts := []string{"0xabc123", "0xdef456"}
+
+		// Query each contract separately and combine results
+		for _, contract := range contracts {
+			var results []TokenWithHashPartition
+			err := testDB.Model(&TokenWithHashPartition{}).
+				Where("contract = ?", contract).
+				Where("(metadata_status = ? OR metadata_status = ?) AND burned_block IS NULL AND token_uri_status != ?",
+					"PENDING", "FAILED", "FAILED").
+				Where("last_metadata_check IS NOT NULL AND last_metadata_check < NOW() - INTERVAL '10080 minutes'").
+				Where("last_metadata_attempt IS NOT NULL AND last_metadata_attempt < NOW() - INTERVAL '10080 minutes'").
+				Order("last_metadata_check").
+				Limit(10000).
+				Find(&results).Error
+
+			tassert.NoError(t, err, "Query for contract should succeed")
+			allResults = append(allResults, results...)
+		}
+
+		tassert.GreaterOrEqual(t, len(allResults), 3, "Should find at least 3 matching tokens across all contracts")
+		t.Logf("Found %d total results with separate queries", len(allResults))
 	})
 }
