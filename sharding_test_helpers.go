@@ -2,9 +2,6 @@ package sharding
 
 import (
 	"fmt"
-	"github.com/bwmarrin/snowflake"
-	"github.com/stretchr/testify/assert"
-	"gorm.io/gorm"
 	"hash/crc32"
 	"hash/fnv"
 	"os"
@@ -13,6 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/bwmarrin/snowflake"
+	"github.com/stretchr/testify/assert"
+	"gorm.io/gorm"
 )
 
 func truncateTables(db *gorm.DB, tables ...string) {

@@ -558,7 +558,7 @@ func TestFillID(t *testing.T) {
 }
 
 func TestInsertManyWithFillID(t *testing.T) {
-	err := db.Create([]Order{{UserID: 100, Product: "Mac", CategoryID: 1}, {UserID: 100, Product: "Mac Pro", CategoryID: 2}}).Error
+	err := db.Create([]Order{{UserID: 100, Product: "Mac"}, {UserID: 100, Product: "Mac Pro"}}).Error
 	assert.Equal[error, error](t, err, nil)
 
 	expected := `INSERT INTO orders_0 ("user_id", "product", "category_id", id) VALUES ($1, $2, $3, $sfid), ($4, $5, $6, $sfid) RETURNING "id"`
@@ -568,8 +568,32 @@ func TestInsertManyWithFillID(t *testing.T) {
 }
 
 func TestInsertDiffSuffix(t *testing.T) {
-	err := db.Create([]Order{{UserID: 100, Product: "Mac"}, {UserID: 101, Product: "Mac Pro"}}).Error
-	assert.Equal(t, ErrInsertDiffSuffix, err)
+	// Ensure tables are clean before the test
+	db.Exec("DELETE FROM orders_0")
+	db.Exec("DELETE FROM orders_1")
+
+	ordersToInsert := []Order{{UserID: 100, Product: "Mac"}, {UserID: 101, Product: "Mac Pro"}}
+	err := db.Create(&ordersToInsert).Error
+	// Original assertion: assert.Equal(t, ErrInsertDiffSuffix, err)
+	// New assertion: Expect success now that HandleBatchInsert executes multi-shard inserts
+	assert.Nil(t, err)
+
+	// Verify data was inserted into the correct shards
+	var order0 Order
+	err = db.Table("orders_0").Where("user_id = ?", 100).First(&order0).Error
+	assert.Nil(t, err, "Error fetching from orders_0")
+	assert.Equal(t, int64(100), order0.UserID)
+	assert.Equal(t, "Mac", order0.Product)
+
+	var order1 Order
+	err = db.Table("orders_1").Where("user_id = ?", 101).First(&order1).Error
+	assert.Nil(t, err, "Error fetching from orders_1")
+	assert.Equal(t, int64(101), order1.UserID)
+	assert.Equal(t, "Mac Pro", order1.Product)
+
+	// Verify IDs were assigned (assuming auto-increment or snowflake)
+	assert.NotEqual(t, int64(0), order0.ID, "ID should be assigned for orders_0")
+	assert.NotEqual(t, int64(0), order1.ID, "ID should be assigned for orders_1")
 }
 
 func TestSelect1(t *testing.T) {

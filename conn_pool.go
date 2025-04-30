@@ -125,11 +125,13 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 				return result, nil
 			}
 
-			// If batch handling failed, log and continue with original error
+			// If batch handling failed, log and fall through to standard error handling below.
 			GetLogger().Debug("Batch handler failed: %v, proceeding with original error", batchErr)
+			err = batchErr // Overwrite the original ErrInsertDiffSuffix with the actual batch handler error
+		} else {
+			// If it wasn't an INSERT, we still have the original ErrInsertDiffSuffix in 'err'.
+			// Fall through to standard error handling.
 		}
-
-		return nil, err
 	}
 
 	// Double-write ensures data consistency during migration from non-sharded to sharded tables
@@ -265,11 +267,13 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 				return pool.ConnPool.QueryContext(ctx, "SELECT 1 WHERE 1=0", []interface{}{}...)
 			}
 
-			// If batch handling failed, log and continue with original error
+			// If batch handling failed, log and fall through to standard error handling below.
 			GetLogger().Debug("Batch handler failed: %v, proceeding with original error", batchErr)
+			err = batchErr // Overwrite the original ErrInsertDiffSuffix with the actual batch handler error
+		} else {
+			// If it wasn't an INSERT, we still have the original ErrInsertDiffSuffix in 'err'.
+			// Fall through to standard error handling.
 		}
-
-		return nil, err
 	}
 
 	// Thread-safe query storage is critical for concurrent operation reliability
