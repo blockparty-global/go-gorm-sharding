@@ -849,9 +849,31 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				}
 
 				if tableName == "" && len(tables) > 0 {
-					tableName = tables[0]
+					tableName = tables[0] // Assign a table name if possible
 				}
-				return ftQuery, stQuery, tableName, ErrMissingShardingKey
+
+				// Check DoubleWrite before returning ErrMissingShardingKey for SELECT
+				canUseBaseTable := false
+				if tableName != "" { // Ensure we have a table name to check config
+					s.mutex.RLock()
+					cfg, ok := s.configs[tableName]
+					s.mutex.RUnlock()
+					if ok && cfg.DoubleWrite {
+						canUseBaseTable = true
+					}
+				}
+
+				if canUseBaseTable {
+					// DoubleWrite enabled, signal to use the base table query (ftQuery)
+					GetLogger().Debug("SELECT without sharding key for table '%s', DoubleWrite enabled. Using base table query.", tableName)
+					// Return the original query (ftQuery) and nil error.
+					// Both ftQuery and stQuery should be the original query in this case.
+					return query, query, tableName, nil
+				} else {
+					// DoubleWrite is false or config not found, return the error
+					GetLogger().Error("SELECT without sharding key for table '%s', DoubleWrite disabled or config missing. Returning error.", tableName)
+					return ftQuery, stQuery, tableName, ErrMissingShardingKey
+				}
 			}
 		}
 

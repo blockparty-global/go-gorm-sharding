@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tassert "github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gorm.io/gorm/logger"
 
 	"github.com/bwmarrin/snowflake"
@@ -246,6 +247,7 @@ func init() {
 		},
 		DefaultPartition:    -1, // Error if unknown type
 		PrimaryKeyGenerator: PKSnowflake,
+		DoubleWrite:         true,
 		// Debug the ListValues to make sure they're being registered correctly
 		ShardingAlgorithm: func(value interface{}) (string, error) {
 			var strValue string
@@ -2992,4 +2994,43 @@ func TestILikeWithConcatenationSharding(t *testing.T) {
 
 		t.Logf("Last query: %s", hashMiddleware.LastQuery())
 	})
+}
+
+// TestSelectNonShardingKeyWithLimit tests querying a list-partitioned table
+// using a non-sharding key column with LIMIT 1 (implicit in First()).
+// It expects an error because the sharding key ('type') is missing.
+func TestSelectNonShardingKeyWithLimit(t *testing.T) {
+	//// Ensure the relevant tables are clean
+	truncateTables(dbList, "contracts", "contracts_0", "contracts_1", "contracts_2")
+
+	// Insert a test contract into a specific partition (e.g., ERC20 -> contracts_0)
+	// Explicitly set a positive ID to bypass potential Snowflake generation issues in test setup
+	testContract := Contract{
+		ID:   99999, // Assign a specific positive ID
+		Name: "TestLimitContract",
+		Type: "ERC20", // This determines the shard (contracts_0)
+		Data: "TestData",
+	}
+	err := dbList.Create(&testContract).Error
+	require.NoError(t, err, "Failed to insert test contract")
+	// Verify the ID is positive after Create (it might be the assigned 99999 or a sequence ID)
+	require.Greater(t, testContract.ID, int64(0), "Test contract ID should be positive after Create")
+
+	// Attempt to query using a non-sharding key ('name') with First() (which adds LIMIT 1)
+	var foundContract Contract
+	err = dbList.Model(&Contract{}).Where("name = ?", "TestLimitContract").First(&foundContract).Error
+
+	// Assert that NO error occurred because DoubleWrite is enabled, allowing fallback to the base table
+	require.NoError(t, err, "Query without sharding key should fallback to base table and succeed when DoubleWrite is true")
+
+	// Assert that the correct contract was found from the base table by checking non-ID fields.
+	// The ID found will likely be the sequence-generated one from the base table insert.
+	require.Greater(t, foundContract.ID, int64(0), "Found contract ID should be positive (from base table sequence)")
+	require.Equal(t, "TestLimitContract", foundContract.Name, "Found contract name should match")
+	require.Equal(t, "ERC20", foundContract.Type, "Found contract type should match")
+
+	t.Logf("Successfully verified that querying by non-sharding key with LIMIT 1 falls back to base table and finds the correct record (ID: %d).", foundContract.ID)
+
+	// Clean up
+	truncateTables(dbList, "contracts", "contracts_0", "contracts_1", "contracts_2")
 }
