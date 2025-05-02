@@ -520,6 +520,188 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 	case *pg_query.Node_SelectStmt:
 		isSelect = true
 		selectStmt = stmtNode.SelectStmt
+
+		// --- UNION/UNION ALL Handling ---
+		// Check if Op is SETOP_UNION. The 'All' field distinguishes UNION from UNION ALL.
+		if selectStmt.Op == pg_query.SetOperation_SETOP_UNION {
+			// This is a UNION query. We need to process each part to find all required shards.
+			allSuffixes := make(map[string]bool) // Collect unique suffixes
+
+			// Helper function to process a select statement (part of the UNION)
+			processUnionPart := func(partStmt *pg_query.SelectStmt) error {
+				partTables := collectTablesFromSelect(partStmt)
+				partConditions := collectConditionsFromSelect(partStmt) // Collect conditions including JOINs
+
+				for _, tbl := range partTables {
+					s.mutex.RLock()
+					cfg, ok := s.configs[tbl]
+					s.mutex.RUnlock()
+					if !ok {
+						continue // Skip non-sharded tables in this part
+					}
+
+					// Extract sharding key/ID for this part
+					// Need alias map for this specific part if it uses aliases
+					partAliasMap := make(map[string]string)
+					for _, fromItem := range partStmt.FromClause {
+						if joinExpr, ok := fromItem.Node.(*pg_query.Node_JoinExpr); ok {
+							mergeMaps(partAliasMap, collectAliasesFromJoin(joinExpr.JoinExpr))
+						} else if rangeVar, ok := fromItem.Node.(*pg_query.Node_RangeVar); ok {
+							if rangeVar.RangeVar.Alias != nil {
+								partAliasMap[rangeVar.RangeVar.Alias.Aliasname] = rangeVar.RangeVar.Relname
+							} else {
+								partAliasMap[rangeVar.RangeVar.Relname] = rangeVar.RangeVar.Relname // Map table to itself if no alias
+							}
+						}
+					}
+
+					value, id, keyFound, err := s.extractShardingKeyFromConditions(cfg.ShardingKey, partConditions, args, partAliasMap, tbl)
+					if err != nil && !errors.Is(err, ErrMissingShardingKey) { // Ignore missing key error for now, handle later
+						GetLogger().Info("Error extracting sharding key for table %s in UNION part: %v", tbl, err) // Changed Warn to Info
+						// Decide how to handle errors - maybe skip this part or return error?
+						// For now, let's try to continue if possible, but log it.
+						// If DoubleWrite is enabled, we might proceed with base table.
+						if !(cfg.DoubleWrite && errors.Is(err, ErrMissingShardingKey)) {
+							return fmt.Errorf("error extracting sharding key for table %s in UNION part: %w", tbl, err)
+						}
+						// If DoubleWrite and missing key, we might query the base table, effectively querying all shards.
+						// Add all possible suffixes for this table.
+						if cfg.ShardingSuffixs != nil {
+							for _, sfx := range cfg.ShardingSuffixs() {
+								allSuffixes[sfx] = true
+							}
+						}
+						continue // Continue to next table in this part
+					}
+
+					if keyFound || id != 0 {
+						suffix, suffixErr := getSuffix(value, id, keyFound, cfg)
+						if suffixErr != nil {
+							// Handle error getting suffix (e.g., invalid value for list partitioning)
+							return fmt.Errorf("error determining suffix for table %s in UNION part: %w", tbl, suffixErr)
+						}
+						allSuffixes[suffix] = true
+					} else if cfg.DoubleWrite {
+						// DoubleWrite enabled and no key found - query all shards for this table
+						GetLogger().Debug("DoubleWrite enabled for table %s in UNION part, no key found. Querying all shards.", tbl)
+						if cfg.ShardingSuffixs != nil {
+							for _, sfx := range cfg.ShardingSuffixs() {
+								allSuffixes[sfx] = true
+							}
+						}
+					} else {
+						// No key found and DoubleWrite is not enabled - this is an error
+						return fmt.Errorf("missing sharding key for table %s in UNION part and DoubleWrite not enabled: %w", tbl, ErrMissingShardingKey)
+					}
+				}
+				return nil
+			}
+
+			// Recursively process UNION parts
+			var processNode func(*pg_query.Node) error
+			processNode = func(node *pg_query.Node) error {
+				if node == nil {
+					return nil
+				}
+				if selStmtNode, ok := node.Node.(*pg_query.Node_SelectStmt); ok {
+					subSelectStmt := selStmtNode.SelectStmt
+					if subSelectStmt.Op == pg_query.SetOperation_SETOP_UNION { // Check for UNION op
+						// Nested UNION - Wrap Larg/Rarg back into Node for recursion
+						if subSelectStmt.Larg != nil {
+							largNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: subSelectStmt.Larg}}
+							if err := processNode(largNode); err != nil {
+								return err
+							}
+						}
+						if subSelectStmt.Rarg != nil {
+							rargNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: subSelectStmt.Rarg}}
+							if err := processNode(rargNode); err != nil {
+								return err
+							}
+						}
+					} else {
+						// Base SELECT statement
+						if err := processUnionPart(subSelectStmt); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				// Handle other node types if necessary, e.g., RangeSubselect
+				return fmt.Errorf("unexpected node type in UNION structure: %T", node.Node)
+			}
+
+			// Start processing from the top-level UNION statement
+			if err := processNode(stmt.Stmt); err != nil {
+				return ftQuery, stQuery, tableName, fmt.Errorf("error processing UNION query: %w", err)
+			}
+
+			if len(allSuffixes) == 0 {
+				// No sharded tables found or no suffixes determined?
+				// This might happen if only non-sharded tables are involved.
+				GetLogger().Debug("UNION query does not involve any determinable shards. Proceeding without rewrite.")
+				return query, query, tableName, nil
+			}
+
+			// --- Rewrite the UNION query ---
+			// Create a UNION ALL query targeting each required shard.
+			rewrittenQueries := []string{}
+			originalUnionQuery := query // Keep the original structure
+
+			// Get all base table names involved in the original UNION
+			unionTables := collectAllTablesFromUnion(selectStmt)
+			if len(unionTables) > 0 {
+				// Get the first table name encountered from the map
+				for t := range unionTables {
+					tableName = t
+					break // Only need one for potential config lookup
+				}
+			}
+
+			for suffix := range allSuffixes {
+				// Create a temporary map for this specific suffix
+				suffixTableMap := make(map[string]string)
+				s.mutex.RLock()
+				for baseTbl := range s.configs { // Iterate over configured tables
+					// Only add tables that were actually present in the original UNION query
+					if _, exists := unionTables[baseTbl]; exists {
+						suffixTableMap[baseTbl] = baseTbl + suffix
+					}
+				}
+				s.mutex.RUnlock()
+
+				// Parse the original UNION query again to get a fresh AST
+				parsedOriginal, parseErr := pg_query.Parse(originalUnionQuery)
+				if parseErr != nil {
+					return ftQuery, stQuery, tableName, fmt.Errorf("error re-parsing original UNION query: %v", parseErr)
+				}
+				if len(parsedOriginal.Stmts) == 0 {
+					return ftQuery, stQuery, tableName, fmt.Errorf("no statements found in re-parsed UNION query")
+				}
+				unionStmtNode := parsedOriginal.Stmts[0]
+
+				// Replace table names in this AST copy with the current suffix
+				replaceTableNames(unionStmtNode.Stmt, suffixTableMap)
+
+				// Deparse this modified AST back to SQL
+				deparsedSQL, deparseErr := pg_query.Deparse(&pg_query.ParseResult{Stmts: []*pg_query.RawStmt{unionStmtNode}})
+				if deparseErr != nil {
+					return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing modified UNION query for suffix %s: %v", suffix, deparseErr)
+				}
+				// Wrap in parentheses for clarity in the final UNION ALL
+				rewrittenQueries = append(rewrittenQueries, "("+deparsedSQL+")")
+			}
+
+			// Combine the rewritten queries with UNION ALL
+			stQuery = strings.Join(rewrittenQueries, " UNION ALL ")
+			ftQuery = query // Keep original query for potential double write? Or should ftQuery also be rewritten? Let's keep original for now.
+
+			GetLogger().Debug("Rewritten UNION query for shards %v: %s", mapsKeys(allSuffixes), stQuery)
+			return ftQuery, stQuery, tableName, nil // Return the rewritten query
+		}
+		// --- End UNION/UNION ALL Handling ---
+
+		// Original SELECT logic (if not a UNION)
 		tables = collectTablesFromSelect(selectStmt)
 		if selectStmt.WhereClause != nil {
 			conditions = append(conditions, selectStmt.WhereClause)
@@ -1587,6 +1769,44 @@ func collectTablesFromSelect(selectStmt *pg_query.SelectStmt) []string {
 	return tables
 }
 
+// collectAllTablesFromUnion recursively finds all base table names within a UNION structure
+func collectAllTablesFromUnion(selectStmt *pg_query.SelectStmt) map[string]struct{} {
+	allTables := make(map[string]struct{})
+
+	var collect func(*pg_query.Node)
+	collect = func(node *pg_query.Node) {
+		if node == nil {
+			return
+		}
+		if selStmtNode, ok := node.Node.(*pg_query.Node_SelectStmt); ok {
+			subSelectStmt := selStmtNode.SelectStmt
+			if subSelectStmt.Op == pg_query.SetOperation_SETOP_UNION { // Check for UNION op
+				// Nested UNION - Wrap Larg/Rarg back into Node for recursion
+				if subSelectStmt.Larg != nil {
+					largNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: subSelectStmt.Larg}}
+					collect(largNode)
+				}
+				if subSelectStmt.Rarg != nil {
+					rargNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: subSelectStmt.Rarg}}
+					collect(rargNode)
+				}
+			} else {
+				// Base SELECT statement
+				tables := collectTablesFromSelect(subSelectStmt)
+				for _, tbl := range tables {
+					allTables[tbl] = struct{}{}
+				}
+			}
+		}
+		// Handle other node types like RangeSubselect if necessary
+	}
+
+	// Start collection from the top-level SelectStmt node
+	collect(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt}})
+
+	return allTables
+}
+
 // collectTablesFromJoin extracts table names from JOIN expressions
 func collectTablesFromJoin(joinExpr *pg_query.JoinExpr) []string {
 	var tables []string
@@ -1613,6 +1833,15 @@ func collectTablesFromExpr(expr *pg_query.Node) []string {
 	return nil
 }
 
+// Helper function to get keys from a map[string]bool
+func mapsKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func caseInsensitiveTableLookup(tableMap map[string]string, tableName string) (string, bool) {
 	// Direct lookup first
 	if val, ok := tableMap[tableName]; ok {
@@ -1637,15 +1866,18 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 	switch n := node.Node.(type) {
 	case *pg_query.Node_RangeVar:
 		if n.RangeVar.Schemaname != "" {
-			GetLogger().Debug("Skipping schema-qualified table: %s.%s", n.RangeVar.Schemaname, n.RangeVar.Relname)
-
-			// Do not replace schema-qualified table names
+			// GetLogger().Debug("replaceTableNames: Skipping schema-qualified table: %s.%s", n.RangeVar.Schemaname, n.RangeVar.Relname)
 			return
 		}
+		originalName := n.RangeVar.Relname
+		// GetLogger().Debug("replaceTableNames: Processing RangeVar: '%s', tableMap: %v", originalName, tableMap)
 		// Replace table names in RangeVar nodes
-		if shardedName, exists := caseInsensitiveTableLookup(tableMap, n.RangeVar.Relname); exists {
+		if shardedName, exists := caseInsensitiveTableLookup(tableMap, originalName); exists {
+			// GetLogger().Debug("replaceTableNames: Replacing '%s' with '%s'", originalName, shardedName)
 			n.RangeVar.Relname = shardedName
 			n.RangeVar.Location = -1 // Force quoting
+		} else {
+			// GetLogger().Debug("replaceTableNames: No replacement found for '%s' in map", originalName)
 		}
 
 	case *pg_query.Node_UpdateStmt:
@@ -1765,8 +1997,22 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 }
 
 func replaceSelectStmtTableName(selectStmt *pg_query.SelectStmt, tableMap map[string]string) {
+	// Handle UNION operations by recursing into Larg and Rarg
+	if selectStmt.Op == pg_query.SetOperation_SETOP_UNION {
+		if selectStmt.Larg != nil {
+			// Wrap Larg back into a Node before calling replaceTableNames
+			largNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt.Larg}}
+			replaceTableNames(largNode, tableMap)
+		}
+		if selectStmt.Rarg != nil {
+			// Wrap Rarg back into a Node before calling replaceTableNames
+			rargNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt.Rarg}}
+			replaceTableNames(rargNode, tableMap)
+		}
+		// Also process other clauses like ORDER BY, LIMIT if they exist on the UNION node itself
+	}
 
-	// Recursively process FROM clause and other relevant clauses
+	// Recursively process FROM clause and other relevant clauses for non-UNION selects or the base parts of UNIONs
 	for _, item := range selectStmt.FromClause {
 		replaceTableNames(item, tableMap)
 	}
