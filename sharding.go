@@ -1625,62 +1625,58 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 		}
 	} else {
 		// 'id' is not present in insert columns
-		if r.PrimaryKeyGeneratorFn != nil {
-			// Generate ID inside the loop for each row if needed
-			if r.PrimaryKeyGeneratorFn != nil {
-				// Add the 'id' column definition if it wasn't present
-				log.Println("'id' column not present in insert columns; adding it.")
-				insertStmt.Cols = append(insertStmt.Cols, &pg_query.Node{
-					Node: &pg_query.Node_ResTarget{
-						ResTarget: &pg_query.ResTarget{
-							Name: "id",
+		// Only add 'id' if the generator is NOT PKCustom and a generator function exists
+		if r.PrimaryKeyGenerator != PKCustom && r.PrimaryKeyGeneratorFn != nil {
+			// Add the 'id' column definition if it wasn't present
+			log.Println("'id' column not present in insert columns; adding it.")
+			insertStmt.Cols = append(insertStmt.Cols, &pg_query.Node{
+				Node: &pg_query.Node_ResTarget{
+					ResTarget: &pg_query.ResTarget{
+						Name: "id",
+					},
+				},
+			})
+
+			if insertStmt.SelectStmt == nil {
+				return fmt.Errorf("insert statement has no SelectStmt")
+			}
+
+			selectNode, ok := insertStmt.SelectStmt.Node.(*pg_query.Node_SelectStmt)
+			if !ok {
+				return fmt.Errorf("insert statement SelectStmt is not of type SelectStmt")
+			}
+
+			valuesSelect := selectNode.SelectStmt
+			if len(valuesSelect.ValuesLists) == 0 {
+				return fmt.Errorf("insert statement has no VALUES list")
+			}
+
+			// Iterate through each VALUES list to assign a UNIQUE ID
+			for _, valuesList := range valuesSelect.ValuesLists { // Loop starts here
+				listNode, ok := valuesList.Node.(*pg_query.Node_List)
+				if !ok {
+					return fmt.Errorf("unsupported values list type when assigning id")
+				}
+
+				// Generate a NEW unique ID for EACH row in the batch
+				uniqueGeneratedID := r.PrimaryKeyGeneratorFn(int64(shardIndex))
+
+				// Append the unique generated ID to this specific VALUES list
+				// Ensure a distinct A_Const node is created for each row's ID
+				listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
+					Node: &pg_query.Node_AConst{
+						AConst: &pg_query.A_Const{
+							Val: &pg_query.A_Const_Ival{
+								// Create a new Integer struct for each ID
+								Ival: &pg_query.Integer{Ival: int32(uniqueGeneratedID)},
+							},
+							Location: -1, // Force quoting/handling as constant
 						},
 					},
 				})
-
-				if insertStmt.SelectStmt == nil {
-					return fmt.Errorf("insert statement has no SelectStmt")
-				}
-
-				selectNode, ok := insertStmt.SelectStmt.Node.(*pg_query.Node_SelectStmt)
-				if !ok {
-					return fmt.Errorf("insert statement SelectStmt is not of type SelectStmt")
-				}
-
-				valuesSelect := selectNode.SelectStmt
-				if len(valuesSelect.ValuesLists) == 0 {
-					return fmt.Errorf("insert statement has no VALUES list")
-				}
-
-				// Iterate through each VALUES list to assign a UNIQUE ID
-				for _, valuesList := range valuesSelect.ValuesLists { // Loop starts here
-					listNode, ok := valuesList.Node.(*pg_query.Node_List)
-					if !ok {
-						return fmt.Errorf("unsupported values list type when assigning id")
-					}
-
-					// Generate a NEW unique ID for EACH row in the batch
-					uniqueGeneratedID := r.PrimaryKeyGeneratorFn(int64(shardIndex))
-					// Removed the block that skipped adding ID if it was 0
-					// We always want to add the generated value, even if it's 0
-
-					// Append the unique generated ID to this specific VALUES list
-					// Ensure a distinct A_Const node is created for each row's ID
-					listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
-						Node: &pg_query.Node_AConst{
-							AConst: &pg_query.A_Const{
-								Val: &pg_query.A_Const_Ival{
-									// Create a new Integer struct for each ID
-									Ival: &pg_query.Integer{Ival: int32(uniqueGeneratedID)},
-								},
-								Location: -1, // Force quoting/handling as constant
-							},
-						},
-					})
-				}
 			}
-			// Else, PrimaryKeyGeneratorFn is nil, so we skip adding 'id' column
 		}
+		// Else, PrimaryKeyGenerator is PKCustom or PrimaryKeyGeneratorFn is nil, so we skip adding 'id' column
 	}
 
 	return nil

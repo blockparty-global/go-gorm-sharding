@@ -21,6 +21,7 @@ import (
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause" // Import clause package
 	"gorm.io/hints"
 	"gorm.io/plugin/dbresolver"
 )
@@ -67,6 +68,29 @@ type Contract struct {
 	Data      string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// ContractNoID represents a contract table without a managed ID column,
+// using Address as the primary key for conflict resolution.
+type ContractNoID struct {
+	Address          string `gorm:"primaryKey;column:address"` // Use address as primary key
+	IsERC20          bool
+	IsERC721         bool
+	IsERC1155        bool
+	Name             string
+	Symbol           string
+	RawName          []byte
+	RawSymbol        []byte
+	Decimals         *int // Use pointer for nullable integer
+	SupportsMetadata bool
+	CreatedAt        time.Time `gorm:"column:created_at"`
+	CreatedBlock     uint64    `gorm:"column:created_block"`
+	// NO ID FIELD
+}
+
+// TableName specifies the table name for ContractNoID
+func (ContractNoID) TableName() string {
+	return "contract_no_ids" // Base table name for setup
 }
 
 // Product is a model that we don't configure for sharding
@@ -148,6 +172,10 @@ var (
 		DSN:                  dbNoIDURL(),
 		PreferSimpleProtocol: true,
 	}
+	dbNoIDTestConfig = postgres.Config{ // Config for the new test
+		DSN:                  dbNoIDURL(), // Reuse or create a new DSN/DB if needed
+		PreferSimpleProtocol: true,
+	}
 	dbReadConfig = postgres.Config{
 		DSN:                  dbReadURL(),
 		PreferSimpleProtocol: true,
@@ -161,12 +189,12 @@ var (
 		PreferSimpleProtocol: true,
 	}
 
-	db, dbNoID, dbRead, dbWrite, dbList *gorm.DB
+	db, dbNoID, dbRead, dbWrite, dbList, dbNoIDTest *gorm.DB // Add dbNoIDTest
 
-	listConfigs                                                                                                                map[string]Config
-	shardingConfig, shardingConfigOrderDetails, shardingConfigNoID, shardingConfigUser, listShardingConfig, contractDataConfig Config
-	middleware, middlewareNoID, listMiddleware                                                                                 *Sharding
-	node, _                                                                                                                    = snowflake.NewNode(1)
+	listConfigs                                                                                                                                            map[string]Config
+	shardingConfig, shardingConfigOrderDetails, shardingConfigNoID, shardingConfigUser, listShardingConfig, contractDataConfig, shardingConfigContractNoID Config    // Add shardingConfigContractNoID
+	middleware, middlewareNoID, listMiddleware, middlewareContractNoID                                                                                     *Sharding // Add middlewareContractNoID
+	node, _                                                                                                                                                = snowflake.NewNode(1)
 )
 
 func init() {
@@ -205,6 +233,10 @@ func init() {
 			Logger:                                   logger.Default.LogMode(logger.Info),
 		})
 	}
+	dbNoIDTest, _ = gorm.Open(postgres.New(dbNoIDTestConfig), &gorm.Config{
+		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
+	})
 
 	shardingConfig = Config{
 		DoubleWrite:         true,
@@ -342,6 +374,30 @@ func init() {
 		"users":         shardingConfigUser,
 	}
 
+	// Sharding config for the ContractNoID model
+	shardingConfigContractNoID = Config{
+		DoubleWrite:         false,     // Focus on sharded table error
+		ShardingKey:         "address", // Shard by address
+		NumberOfShards:      4,         // Example shard count
+		PrimaryKeyGenerator: PKCustom,  // Use PKCustom instead of PKNone
+		PrimaryKeyGeneratorFn: func(_ int64) int64 { // Provide a function that returns 0
+			return 0
+		},
+		ShardingAlgorithm: func(value interface{}) (string, error) { // Simple hash for string address
+			address, ok := value.(string)
+			if !ok {
+				return "", fmt.Errorf("sharding key must be a string address, got %T", value)
+			}
+			// Example: simple modulo hash (replace with actual logic if known)
+			hash := 0
+			for _, r := range address {
+				hash += int(r)
+			}
+			return fmt.Sprintf("_%d", hash%int(shardingConfigContractNoID.NumberOfShards)), nil
+		},
+		// No ShardingAlgorithmByPrimaryKey needed as PK is address
+	}
+
 	listConfigs = map[string]Config{
 		"contracts":     listShardingConfig,
 		"contract_data": contractDataConfig,
@@ -352,10 +408,16 @@ func init() {
 
 	middleware = Register(configs, &Order{}, &OrderDetail{}, &User{})
 	middlewareNoID = Register(shardingConfigNoID, &Order{}, &OrderDetail{})
+	configsNoID := map[string]Config{
+		"contract_no_ids": shardingConfigContractNoID,
+	}
+	middlewareContractNoID = Register(configsNoID, &ContractNoID{})
 
 	fmt.Println("Clean only tables ...")
-	dropTables()
+	dropTables() // Ensure dropTables includes contract_no_ids and its shards
 	fmt.Println("AutoMigrate tables ...")
+	// ... (existing AutoMigrate calls) ...
+	// Don't AutoMigrate ContractNoID here, we'll create tables manually in the test
 	err := db.AutoMigrate(&Order{}, &Category{}, &OrderDetail{}, &User{})
 	if err != nil {
 		panic(err)
@@ -383,13 +445,22 @@ func init() {
 		}
 	}
 	for i := 0; i < 3; i++ {
-		createContractTable(fmt.Sprintf("contracts_%d", i))
-		createContractDataTable(fmt.Sprintf("contract_data_%d", i))
+		createContractTable(fmt.Sprintf("contracts_%d", i))         // Uses dbList
+		createContractDataTable(fmt.Sprintf("contract_data_%d", i)) // Uses dbList
 	}
+	// Register listMiddleware AFTER creating its tables
+	dbList.Use(listMiddleware)
 
+	// Manually create sharded tables for ContractNoID *without* the ID column
+	for i := 0; i < int(shardingConfigContractNoID.NumberOfShards); i++ {
+		createContractNoIDTable(fmt.Sprintf("contract_no_ids_%d", i)) // Uses dbNoIDTest
+	}
+	// Register middlewareContractNoID AFTER creating its tables
+	dbNoIDTest.Use(middlewareContractNoID) // Use the new middleware on the test DB
+
+	// Register other middleware
 	db.Use(middleware)
 	dbNoID.Use(middlewareNoID)
-	dbList.Use(listMiddleware)
 }
 
 // Helper functions to create tables
@@ -489,6 +560,26 @@ func createContractDataTable(table string) {
     )`)
 }
 
+// createContractNoIDTable creates the sharded table WITHOUT the id column
+func createContractNoIDTable(table string) {
+	// Use dbNoIDTest connection
+	dbNoIDTest.Exec(`DROP TABLE IF EXISTS ` + table + ` CASCADE`) // Drop first
+	dbNoIDTest.Exec(`CREATE TABLE ` + table + ` (
+        address text PRIMARY KEY,
+        is_erc20 boolean,
+        is_erc721 boolean,
+        is_erc1155 boolean,
+        name text,
+        symbol text,
+        raw_name bytea,
+        raw_symbol bytea,
+        decimals integer,
+        supports_metadata boolean,
+        created_at timestamp with time zone,
+        created_block bigint
+    )`)
+}
+
 func dropTables() {
 	// Comprehensive list of all tables used across tests
 	allTestTables := []string{
@@ -511,21 +602,25 @@ func dropTables() {
 		"contract_with_hash_partitions", "contract_with_hash_partitions_0", "contract_with_hash_partitions_1", "contract_with_hash_partitions_2", "contract_with_hash_partitions_3",
 		// Add any other potential test tables here
 		"asset_contracts", "asset_contracts_0", "asset_contracts_1", "asset_contracts_2", "asset_contracts_3", // Added based on previous error log
+		"contract_no_ids", "contract_no_ids_0", "contract_no_ids_1", "contract_no_ids_2", "contract_no_ids_3", // Add new tables
 	}
 
 	// Ensure all DB connections drop these tables
-	dbsToClean := []*gorm.DB{db, dbNoID, dbRead, dbWrite, dbList}
+	dbsToClean := []*gorm.DB{db, dbNoID, dbRead, dbWrite, dbList, dbNoIDTest} // Add dbNoIDTest
 
 	for _, table := range allTestTables {
 		for _, dbConn := range dbsToClean {
 			if dbConn != nil { // Check if DB connection is initialized
 				dbConn.Exec("DROP TABLE IF EXISTS " + table + " CASCADE") // Use CASCADE for safety
-				if mysqlDialector() {
-					// MySQL/MariaDB sequence table naming might differ or not exist, handle appropriately
-					// dbConn.Exec("DROP TABLE IF EXISTS gorm_sharding_" + table + "_id_seq")
-				} else { // Added missing opening brace
-					// PostgreSQL sequence dropping
-					dbConn.Exec("DROP SEQUENCE IF EXISTS gorm_sharding_" + table + "_id_seq")
+				// ... (sequence dropping logic - not applicable for ContractNoID) ...
+				if !strings.HasPrefix(table, "contract_no_ids") { // Don't try to drop sequences for tables without IDs
+					if mysqlDialector() {
+						// MySQL/MariaDB sequence table naming might differ or not exist, handle appropriately
+						// dbConn.Exec("DROP TABLE IF EXISTS gorm_sharding_" + table + "_id_seq")
+					} else { // Added missing opening brace
+						// PostgreSQL sequence dropping
+						dbConn.Exec("DROP SEQUENCE IF EXISTS gorm_sharding_" + table + "_id_seq")
+					}
 				}
 			}
 		}
@@ -597,17 +692,15 @@ func TestInsertNoID(t *testing.T) {
 	assert.NoError(t, err, "InsertNoID create failed")
 
 	// Assert the generated query.
-	// With PKCustom returning 0, the 'id' column IS added, but the value might be handled by DB default.
-	// The RETURNING clause might differ based on dialect.
-	// Let's check if the core part matches, excluding RETURNING for broader compatibility.
-	// Expect 0 as the ID value since the generator returns 0
-	expectedQueryPrefix := `INSERT INTO orders_0 (user_id, product, category_id, id) VALUES ($1, $2, $3, 0)`
+	// Assert the generated query.
+	// With PKCustom returning 0 and the fix applied, the 'id' column should NOT be added.
+	expectedQueryPrefix := `INSERT INTO orders_0 (user_id, product, category_id) VALUES ($1, $2, $3)` // No 'id' column
 	actualQuery := middlewareNoIDTest.LastQuery()
 	// Remove RETURNING clause for comparison if present (might vary by dialect/driver)
 	if retIdx := strings.Index(actualQuery, " RETURNING"); retIdx != -1 {
 		actualQuery = actualQuery[:retIdx]
 	}
-	assert.Equal(t, toDialect(expectedQueryPrefix), actualQuery, "Query should include id column even with PKCustom returning 0")
+	assert.Equal(t, toDialect(expectedQueryPrefix), actualQuery, "Query should NOT include id column when PKCustom is used")
 
 	// Clean up the table on the test connection
 	dbNoIDTest.Exec("DROP TABLE IF EXISTS orders_0 CASCADE")
@@ -3033,4 +3126,60 @@ func TestSelectNonShardingKeyWithLimit(t *testing.T) {
 
 	// Clean up
 	truncateTables(dbList, "contracts", "contracts_0", "contracts_1", "contracts_2")
+}
+
+// TestInsertOnConflictNoIDColumn verifies that inserting into a sharded table
+// without an ID column using ON CONFLICT works correctly after the fix.
+func TestInsertOnConflictNoIDColumn(t *testing.T) {
+	assert := require.New(t) // Use require for fatal assertions
+
+	// Ensure the target sharded table exists and is empty
+	shardSuffix, err := shardingConfigContractNoID.ShardingAlgorithm("0xce99c3c308a444659534e8e7dec9209af2e55dbd")
+	assert.NoError(err, "Failed to calculate shard suffix")
+	targetShardTable := "contract_no_ids" + shardSuffix
+
+	// Explicitly ensure the table exists before the test runs
+	createContractNoIDTable(targetShardTable) // Use the helper function
+
+	dbNoIDTest.Exec("DELETE FROM " + targetShardTable) // Clear the specific shard
+
+	// Data matching the log entry
+	contract := ContractNoID{
+		Address:          "0xce99c3c308a444659534e8e7dec9209af2e55dbd",
+		IsERC20:          false,
+		IsERC721:         true,
+		IsERC1155:        false,
+		Name:             "0x1400123b180", // Example, actual value might differ
+		Symbol:           "0x1400167b930", // Example
+		RawName:          []byte("SepoliaGoldenPass"),
+		RawSymbol:        []byte("GOLD"),
+		Decimals:         nil,
+		SupportsMetadata: true,
+		CreatedAt:        time.Now(), // Use current time or parse from log if needed
+		CreatedBlock:     1248635,
+	}
+
+	// Perform the INSERT ON CONFLICT operation
+	// Mimic the DO UPDATE clause from the log
+	err = dbNoIDTest.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "address"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"is_erc20", "is_erc721", "is_erc1155", "name", "symbol",
+			"raw_name", "raw_symbol", "decimals", "supports_metadata",
+			"created_block", // Note: created_at is often excluded from updates
+		}),
+	}).Create(&contract).Error
+
+	// Assert that NO error occurred because the 'id' column should no longer be added
+	assert.NoError(err, "Create operation should succeed without adding 'id' column")
+
+	// Optional: Log the last query for debugging
+	t.Logf("Last query executed by middlewareContractNoID: %s", middlewareContractNoID.LastQuery())
+
+	// Verify the record exists in the sharded table
+	var foundContract ContractNoID
+	err = dbNoIDTest.Table(targetShardTable).Where("address = ?", contract.Address).First(&foundContract).Error
+	assert.NoError(err, "Failed to find the inserted/updated record in the sharded table")
+	assert.Equal(contract.Address, foundContract.Address)
+	assert.Equal(contract.IsERC721, foundContract.IsERC721) // Check a field that should be updated
 }
