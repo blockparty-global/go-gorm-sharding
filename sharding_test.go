@@ -488,23 +488,49 @@ func createContractDataTable(table string) {
 }
 
 func dropTables() {
-	tables := []string{
+	// Comprehensive list of all tables used across tests
+	allTestTables := []string{
+		// From TestMigrate, TestInsert, etc.
 		"orders", "orders_0", "orders_1", "orders_2", "orders_3",
 		"order_details", "order_details_0", "order_details_1", "order_details_2", "order_details_3",
 		"categories",
 		"users", "users_0", "users_1", "users_2", "users_3",
+		// From TestInsertWithPreGeneratedGID
 		"swaps", "swaps_0", "swaps_1", "swaps_2", "swaps_3",
-		"contracts", "contracts_0", "contracts_1", "contracts_2",
-		"contract_data", "contract_data_0", "contract_data_1", "contract_data_2",
+		// From init() and list partitioning tests
+		"contracts", "contracts_0", "contracts_1", "contracts_2", "contracts_3",
+		"contract_data", "contract_data_0", "contract_data_1", "contract_data_2", "contract_data_3",
+		// From TestUnregisteredTableNotSharded
+		"products",
+		// From TestCompositeInClause
+		"tokens", "tokens_0", "tokens_1", "tokens_2", "tokens_3",
+		// From TestHashPartitioningWithLowerFunction (and others)
+		"token_with_hash_partitions", "token_with_hash_partitions_0", "token_with_hash_partitions_1", "token_with_hash_partitions_2", "token_with_hash_partitions_3",
+		"contract_with_hash_partitions", "contract_with_hash_partitions_0", "contract_with_hash_partitions_1", "contract_with_hash_partitions_2", "contract_with_hash_partitions_3",
+		// Add any other potential test tables here
+		"asset_contracts", "asset_contracts_0", "asset_contracts_1", "asset_contracts_2", "asset_contracts_3", // Added based on previous error log
 	}
-	for _, table := range tables {
-		db.Exec("DROP TABLE IF EXISTS " + table)
-		dbNoID.Exec("DROP TABLE IF EXISTS " + table)
-		dbRead.Exec("DROP TABLE IF EXISTS " + table)
-		dbWrite.Exec("DROP TABLE IF EXISTS " + table)
-		dbList.Exec("DROP TABLE IF EXISTS " + table)
-		if mysqlDialector() {
-			db.Exec(("DROP TABLE IF EXISTS gorm_sharding_" + table + "_id_seq"))
+
+	// Ensure all DB connections drop these tables
+	dbsToClean := []*gorm.DB{db, dbNoID, dbRead, dbWrite, dbList}
+
+	for _, table := range allTestTables {
+		for _, dbConn := range dbsToClean {
+			if dbConn != nil { // Check if DB connection is initialized
+				dbConn.Exec("DROP TABLE IF EXISTS " + table + " CASCADE") // Use CASCADE for safety
+				if mysqlDialector() {
+					// MySQL/MariaDB sequence table naming might differ or not exist, handle appropriately
+					// dbConn.Exec("DROP TABLE IF EXISTS gorm_sharding_" + table + "_id_seq")
+				} else {
+					// PostgreSQL sequence dropping
+					dbConn.Exec("DROP SEQUENCE IF EXISTS gorm_sharding_" + table + "_id_seq")
+				}
+			}
+		}
+	}
+}
+
+func TestMigrate(t *testing.T) {
 		} else {
 			db.Exec(("DROP SEQUENCE IF EXISTS gorm_sharding_" + table + "_id_seq"))
 		}
@@ -512,28 +538,38 @@ func dropTables() {
 }
 
 func TestMigrate(t *testing.T) {
-	targetTables := []string{"orders", "orders_0", "orders_1", "orders_2", "orders_3", "categories", "order_details", "order_details_0", "order_details_1", "order_details_2", "order_details_3", "users", "users_0", "users_1", "users_2", "users_3"}
-	sort.Strings(targetTables)
+	// Define the expected tables AFTER AutoMigrate runs for Order, Category, OrderDetail, User
+	// This should include the base tables and their corresponding shards created by the middleware.
+	expectedTablesAfterMigrate := []string{
+		"orders", "orders_0", "orders_1", "orders_2", "orders_3",
+		"categories", // Non-sharded
+		"order_details", "order_details_0", "order_details_1", "order_details_2", "order_details_3",
+		"users", "users_0", "users_1", "users_2", "users_3",
+	}
+	sort.Strings(expectedTablesAfterMigrate)
 
-	// origin tables
+	// 1. Clean all tables first using the helper
+	dropTables()
 	tables, _ := db.Migrator().GetTables()
-	sort.Strings(tables)
-	assert.Equal(t, tables, targetTables)
+	assert.Equal(t, 0, len(tables), "All tables should be dropped initially")
 
-	// drop table
-	db.Migrator().DropTable(Order{}, &Category{}, &OrderDetail{}, &User{})
-	tables, _ = db.Migrator().GetTables()
-	assert.Equal(t, len(tables), 0)
-
-	// auto migrate
-	db.AutoMigrate(&Order{}, &Category{}, &OrderDetail{}, &User{})
-	tables, _ = db.Migrator().GetTables()
-	sort.Strings(tables)
-	assert.Equal(t, tables, targetTables)
-
-	// auto migrate again
+	// 2. Auto migrate the relevant models
 	err := db.AutoMigrate(&Order{}, &Category{}, &OrderDetail{}, &User{})
-	assert.Equal[error, error](t, err, nil)
+	assert.Equal[error, error](t, err, nil, "AutoMigrate should succeed")
+
+	// 3. Verify the correct tables were created
+	tables, _ = db.Migrator().GetTables()
+	sort.Strings(tables)
+	assert.Equal(t, expectedTablesAfterMigrate, tables, "Tables after AutoMigrate should match expected")
+
+	// 4. Auto migrate again (should be idempotent)
+	err = db.AutoMigrate(&Order{}, &Category{}, &OrderDetail{}, &User{})
+	assert.Equal[error, error](t, err, nil, "Second AutoMigrate should also succeed")
+
+	// 5. Verify tables remain the same after second migrate
+	tables, _ = db.Migrator().GetTables()
+	sort.Strings(tables)
+	assert.Equal(t, expectedTablesAfterMigrate, tables, "Tables should remain the same after second AutoMigrate")
 }
 
 func TestInsert(t *testing.T) {

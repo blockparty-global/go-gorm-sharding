@@ -419,8 +419,8 @@ func TestHashPartitioningWithLowerFunction(t *testing.T) {
 	for _, contract := range contracts {
 		// Create multiple tokens per contract
 		for i := 1; i <= 3; i++ {
+			// Let the PrimaryKeyGenerator (Snowflake) assign the ID automatically
 			token := TokenWithHashPartition{
-				ID:             int64(i),
 				Contract:       contract.Address,
 				TokenID:        fmt.Sprintf("%d", i),
 				TokenURIStatus: "READY",
@@ -549,7 +549,8 @@ func TestHashPartitioningWithLowerFunction(t *testing.T) {
 			Find(&results).Error
 
 		tassert.NoError(t, err, "Query with nosharding and IN clause should execute without errors")
-		tassert.Equal(t, 3, len(results), "Should find 3 tokens in total")
+		// Expect 12 tokens: 3 tokens for each of the 4 contracts matching LOWER('MTKN')
+		tassert.Equal(t, 12, len(results), "Should find 12 tokens in total (3 for each of the 4 MTKN contracts)")
 
 		t.Logf("Found %d tokens with contract addresses IN clause", len(results))
 	})
