@@ -16,11 +16,15 @@ import (
 
 var (
 	// insertRegex is a regular expression pattern used to parse INSERT statements.
-	// It captures the table name, column names, and values portion.
-	insertRegex = regexp.MustCompile(`(?i)INSERT\s+INTO\s+(?:"([a-zA-Z0-9_]+)"|([a-zA-Z0-9_]+))\s+\((.*?)\)\s+VALUES\s*(.*)`)
+	// It captures the table name, column names, and values portion, excluding ON CONFLICT.
+	insertRegex = regexp.MustCompile(`(?i)INSERT\s+INTO\s+(?:"([a-zA-Z0-9_]+)"|([a-zA-Z0-9_]+))\s+\((.*?)\)\s+VALUES\s*(.*?)(?:\s+ON\s+CONFLICT.*|\s*$)`)
 
 	// shardingKeyRegex is a regular expression pattern used to find column names in both quoted and unquoted formats.
-	shardingKeyRegex = regexp.MustCompile(`(?:"([^"]+)"|([a-zA-Z0-9_]+))`)
+	// Handles quoted ("column_name") and unquoted (column_name) identifiers.
+	shardingKeyRegex = regexp.MustCompile(`"([^"]+)"|([a-zA-Z0-9_]+)`)
+
+	// suffixRegex attempts to extract the shard suffix (e.g., _0, _1) from a table name within a query string.
+	suffixRegex = regexp.MustCompile(`(?i)INSERT\s+INTO\s+(?:"[a-zA-Z0-9]+(_[0-9]+)"|[a-zA-Z0-9]+(_[0-9]+))\s+`)
 
 	// ErrSkipBatchHandler is returned when a query should be processed by the standard handler
 	// rather than the batch handler. This is not an error condition, but a control flow signal.
@@ -205,35 +209,20 @@ func GetQueryCacheStats() map[string]interface{} {
 	return getQueryCache().GetStats()
 }
 
-// SplitBatchInsertByShards splits a batch INSERT statement by shards if records
-// map to different shards. It analyzes the INSERT statement, extracts the sharding key values
-// for each record, and groups the records by the shard they belong to.
-//
-// The function returns ErrSkipBatchHandler in cases where batch handling isn't applicable, such as:
-// - Non-INSERT queries
-// - INSERT queries without multiple value groups
-// - INSERT queries for non-sharded tables
-//
-// This function now always creates separate queries for each unique sharding key value,
-// preventing the "can not insert different suffix table in one query" error
-// by ensuring all values in each resulting query have the same sharding key.
-func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([]string, [][]interface{}, error) {
+// SplitBatchInsertByShards splits a batch INSERT statement by shards.
+// It now accepts pre-generated primary keys (if applicable) and ensures they are included
+// in the resulting shard-specific queries and parameters.
+func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}, generatedIDs []int64) ([]string, [][]interface{}, error) {
 	// Only process INSERT statements
 	if !strings.Contains(strings.ToUpper(query), "INSERT INTO") {
 		return nil, nil, ErrSkipBatchHandler
 	}
 
-	// Skip batch handling for ON CONFLICT statements
-	if strings.Contains(strings.ToUpper(query), "ON CONFLICT") {
-		if DefaultLogLevel >= LogLevelDebug {
-			debugLog("Skipping batch handling for query with ON CONFLICT clause")
-		}
-		return nil, nil, ErrSkipBatchHandler
-	}
+	// Get ON CONFLICT clause if present - We need this regardless of cache hit
+	conflictClause := ExtractOnConflictClause(query)
 
 	var tableName, columnsStr, valuesStr string
 	var shardingKeyIndex int
-	var conflictClause string
 
 	// Try to get cached query information
 	cache := getQueryCache()
@@ -245,7 +234,6 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		columnsStr = cacheEntry.columnsStr
 		valuesStr = cacheEntry.valuesStr
 		shardingKeyIndex = cacheEntry.shardingKeyIndex
-		conflictClause = cacheEntry.conflictClause
 
 		if DefaultLogLevel >= LogLevelDebug {
 			debugLog("Query cache hit for query: %s", query)
@@ -305,11 +293,6 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 			return nil, nil, ErrSkipBatchHandler
 		}
 
-		// Get ON CONFLICT clause if present
-		if strings.Contains(strings.ToUpper(query), "ON CONFLICT") {
-			conflictClause = ExtractOnConflictClause(query)
-		}
-
 		// Cache the parsed query
 		cache.Put(query, &QueryCacheEntry{
 			tableName:        tableName,
@@ -319,6 +302,19 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 			conflictClause:   conflictClause,
 			lastAccess:       time.Now(),
 		})
+	}
+
+	// --- Determine if Primary Keys were generated and need inserting ---
+	// (Can check len(generatedIDs) > 0, but also need to ensure the PK column isn't already present)
+	needsIDInjection := len(generatedIDs) > 0
+	pkColName := "id" // Default PK column name, could be configurable
+	columns := strings.Split(columnsStr, ",")
+	for _, col := range columns {
+		colName := strings.TrimSpace(strings.Trim(col, `"`))
+		if colName == pkColName {
+			needsIDInjection = false // PK column already in query
+			break
+		}
 	}
 
 	// Parse the values - this is the complex part
@@ -344,6 +340,7 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 	})
 
 	paramIndex := 0
+	recordIndex := 0 // Index for generatedIDs
 	for _, group := range valueGroups {
 		// Extract parameters for this group
 		paramCount := CountParams(group)
@@ -353,13 +350,23 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		}
 
 		// Get the sharding key value
+		// getParamIndexFromGroup returns the 0-based index within the original 'args' slice
+		// based on the placeholder number (e.g., $5 -> 4).
 		shardingKeyParamIndex := getParamIndexFromGroup(group, shardingKeyIndex)
-		if shardingKeyParamIndex < 0 || shardingKeyParamIndex >= len(args) {
-			return nil, nil, fmt.Errorf("%w: invalid parameter index %d",
-				ErrShardingKeyExtract, shardingKeyParamIndex)
+		if shardingKeyParamIndex < 0 {
+			// This implies the placeholder was not found or invalid in the specific group,
+			// which shouldn't happen if the initial parsing was correct, but handle defensively.
+			return nil, nil, fmt.Errorf("%w: could not find sharding key placeholder within value group", ErrShardingKeyExtract)
 		}
 
-		shardingKeyValue := args[shardingKeyParamIndex]
+		// Validate the returned index before using it
+		if shardingKeyParamIndex >= len(args) {
+			// This indicates an issue with placeholder parsing or args length mismatch
+			return nil, nil, fmt.Errorf("%w: sharding key index %d from placeholder is out of bounds for args length %d",
+				ErrShardingKeyExtract, shardingKeyParamIndex, len(args))
+		}
+
+		shardingKeyValue := args[shardingKeyParamIndex] // Use the index directly from getParamIndexFromGroup
 
 		// Get the suffix for this value
 		suffix, err := getSuffix(shardingKeyValue, 0, true, config)
@@ -385,9 +392,20 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		keyGroup.valueGroups = append(keyGroup.valueGroups, group)
 		groupParams := args[paramIndex : paramIndex+paramCount]
 		keyGroup.params = append(keyGroup.params, groupParams...)
+
+		// --- Inject the generated ID into the parameters for this record ---
+		if needsIDInjection {
+			if recordIndex >= len(generatedIDs) {
+				return nil, nil, fmt.Errorf("mismatch between number of records and generated IDs")
+			}
+			keyGroup.params = append(keyGroup.params, generatedIDs[recordIndex])
+		}
+		// ----------------------------------------------------------------
+
 		keyValueGroups[shardingKeyValue] = keyGroup
 
 		paramIndex += paramCount
+		recordIndex++ // Increment record index for the next ID
 	}
 
 	// If we have only one group and it's a small batch, let the standard handler process it
@@ -401,11 +419,15 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		return nil, nil, ErrSkipBatchHandler
 	}
 
-	// If we have multiple groups (different sharding keys), we need to return ErrInsertDiffSuffix
-	// for tests that expect this error
-	if len(keyValueGroups) > 1 {
-		return nil, nil, ErrInsertDiffSuffix
-	}
+	// If we have multiple groups (different sharding keys), proceed to generate
+	// the split queries/params and return them with a nil error.
+	// The HandleBatchInsert function will execute these individual queries.
+	// REMOVED: Check for len(keyValueGroups) > 1 and return ErrInsertDiffSuffix
+	/*
+		if len(keyValueGroups) > 1 {
+			return nil, nil, ErrInsertDiffSuffix
+		}
+	*/
 
 	// Generate a query for each unique sharding key value
 	var queries []string
@@ -414,42 +436,39 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 	for keyValue, keyGroup := range keyValueGroups {
 		shardTableName := tableName + keyGroup.suffix
 
-		// Check if we need to add 'id' column
-		needsID := !strings.Contains(strings.ToLower(columnsStr), "id")
-
-		cols := columnsStr
-		if needsID {
-			cols = columnsStr + ", id"
+		// --- Adjust columns and placeholders for injected ID ---
+		finalColumnsStr := columnsStr
+		if needsIDInjection {
+			finalColumnsStr = columnsStr + ", \"" + pkColName + "\"" // Add PK col name
 		}
 
-		// For each value group, we may need to add the ID
-		valueGroupsWithID := make([]string, len(keyGroup.valueGroups))
+		// Build the VALUES part with correct placeholders
+		finalValueGroups := make([]string, len(keyGroup.valueGroups))
+		placeholderOffset := 0
 		for i, vg := range keyGroup.valueGroups {
-			if needsID {
-				// Remove surrounding parentheses, add ID, put parentheses back
-				innerValues := vg[1 : len(vg)-1]
-				valueGroupsWithID[i] = "(" + innerValues + ", $sfid)"
-			} else {
-				valueGroupsWithID[i] = vg
+			baseParamCountPerGroup := CountParams(vg) // Calculate for each group
+			// Create placeholders like ($1, $2, $3) or ($1, $2, $3, $4) if ID injected
+			numPlaceholders := baseParamCountPerGroup
+			if needsIDInjection {
+				numPlaceholders++
 			}
-		}
-
-		// Construct a query for this key value
-		// The test expects quotes around column names for TestInsertManyWithFillID
-		quotedCols := cols
-		if strings.Contains(columnsStr, "\"") {
-			// If the original columns had quotes, we need to make sure our format matches
-			if needsID {
-				quotedCols = columnsStr + ", \"id\""
+			placeholders := make([]string, numPlaceholders)
+			for j := 0; j < numPlaceholders; j++ {
+				placeholders[j] = fmt.Sprintf("$%d", placeholderOffset+j+1)
 			}
+			finalValueGroups[i] = "(" + strings.Join(placeholders, ", ") + ")"
+			placeholderOffset += numPlaceholders
 		}
+		// ------------------------------------------------------
 
-		shardQuery := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
-			s.quoteIdent(shardTableName),
-			quotedCols,
-			strings.Join(valueGroupsWithID, ","))
+		// Construct the final query for this shard
+		// Use placeholders ($1, $2, ...) which are database-agnostic
+		shardQuery := fmt.Sprintf("INSERT INTO \"%s\" (%s) VALUES %s",
+			shardTableName,
+			finalColumnsStr,
+			strings.Join(finalValueGroups, ", "))
 
-		// If there's an ON CONFLICT clause, include it
+		// Append the ON CONFLICT clause if it exists
 		if conflictClause != "" {
 			shardQuery += " " + conflictClause
 		}
@@ -458,21 +477,15 @@ func (s *Sharding) SplitBatchInsertByShards(query string, args []interface{}) ([
 		queryParams = append(queryParams, keyGroup.params)
 
 		if DefaultLogLevel >= LogLevelDebug {
-			debugLog("Created batch insert query for key value %v: %s", keyValue, shardQuery)
+			debugLog("Split query for shard '%s' (key: %v): %s | PARAMS: %v", keyGroup.suffix, keyValue, shardQuery, keyGroup.params)
 		}
 	}
 
 	return queries, queryParams, nil
 }
 
-// ParseValueGroups extracts individual VALUE groups from the VALUES portion of an INSERT statement.
-// It properly handles nested parentheses and string literals to ensure correct parsing.
-//
-// Parameters:
-//   - valuesStr: The VALUES portion of an INSERT statement (e.g., "($1, $2), ($3, $4)")
-//
-// Returns:
-//   - []string: Array of value group strings (e.g., ["($1, $2)", "($3, $4)"])
+// ParseValueGroups extracts individual value groups like (?, ?, ?) from the VALUES clause.
+// It needs to handle nested parentheses and quoted strings correctly.
 func ParseValueGroups(valuesStr string) []string {
 	var groups []string
 	depth := 0
@@ -641,35 +654,141 @@ func (ctx *QueryContext) execContext(query string, args ...interface{}) (sql.Res
 // belong to the same shard), ErrSkipBatchHandler is returned to indicate that standard processing
 // should be used instead.
 func (s *Sharding) HandleBatchInsert(ctx *QueryContext, query string, args []interface{}) (sql.Result, error) {
-	// Try to split the batch insert
-	queries, queryParams, err := s.SplitBatchInsertByShards(query, args)
+	// --- START NEW ID GENERATION LOGIC ---
+
+	var generatedIDs []int64 // Slice to hold generated IDs if needed
+
+	// 1. Parse table name early to check config (can reuse logic from SplitBatchInsertByShards cache/parsing)
+	// Simplified parsing for now, assuming standard INSERT format. Robust parsing might be needed.
+	tableName := ""
+	matches := insertRegex.FindStringSubmatch(query)
+	if len(matches) >= 3 {
+		if matches[1] != "" {
+			tableName = matches[1]
+		} else {
+			tableName = matches[2]
+		}
+	}
+
+	config, exists := s.configs[tableName]
+	if exists && config.PrimaryKeyGenerator != PKCustom { // Assuming PKCustom handles its own ID generation later
+		// 2. Determine number of records
+		columnsStr := ""
+		_ = "" // Ignore valuesStr for now, just parse columns to get count
+		if len(matches) >= 5 {
+			columnsStr = matches[3]
+			// valuesStr = matches[4] // Not needed here
+		}
+		numColumns := len(strings.Split(columnsStr, ","))
+		if numColumns > 0 && len(args) > 0 && len(args)%numColumns == 0 {
+			numRecords := len(args) / numColumns
+
+			// 3. Generate IDs using the configured generator function
+			generatedIDs = make([]int64, numRecords)
+			// Check specifically for PKSnowflake or a non-nil custom function
+			if config.PrimaryKeyGenerator != PKSnowflake && config.PrimaryKeyGeneratorFn == nil {
+				return nil, fmt.Errorf("primary key generator function is nil for table %s and generator is not Snowflake", tableName)
+			}
+
+			for i := 0; i < numRecords; i++ {
+				var id int64
+				var err error
+				// Call the appropriate generator
+				if config.PrimaryKeyGenerator == PKSnowflake {
+					if len(s.snowflakeNodes) == 0 {
+						return nil, fmt.Errorf("PKSnowflake generator selected but snowflakeNodes is empty in Sharding struct")
+					}
+					// Use the genSnowflakeKey method, assuming index 0 for batch generation
+					id = s.genSnowflakeKey(0)
+				} else if config.PrimaryKeyGeneratorFn != nil {
+					id = config.PrimaryKeyGeneratorFn(0) // Pass appropriate context if needed
+				} else {
+					// Should not happen due to initial check, but handle defensively
+					err = fmt.Errorf("unsupported or misconfigured primary key generator for table %s", tableName)
+				}
+
+				if err != nil {
+					return nil, fmt.Errorf("failed to generate primary key for record %d: %w", i, err)
+				}
+				generatedIDs[i] = id
+				// TODO: Need to ensure these IDs are unique if generator isn't inherently unique (e.g., time-based)
+				// PKSnowflake should be unique.
+			}
+			if DefaultLogLevel >= LogLevelInfo { // Changed from LogLevelWarn check which was removed previously
+				s.Logger.Info(context.Background(), "Generated %d primary keys for batch insert into %s", len(generatedIDs), tableName)
+			}
+		} else {
+			// Cannot determine number of records, log warning or error?
+			// Let SplitBatchInsert handle potential errors later for now.
+			if DefaultLogLevel >= LogLevelInfo { // Changed from LogLevelWarn check which was removed previously
+				s.Logger.Info(context.Background(), "Could not determine number of records for ID generation in batch insert into %s", tableName)
+			}
+		}
+	}
+	// --- END NEW ID GENERATION LOGIC ---
+
+	// TODO: Pass generatedIDs to SplitBatchInsertByShards once its signature is updated
+	// queries, queryParams, err := s.SplitBatchInsertByShards(query, args, generatedIDs) // Example future call
+	queries, queryParams, err := s.SplitBatchInsertByShards(query, args, generatedIDs) // Current call
 	if err != nil {
-		if errors.Is(err, ErrSkipBatchHandler) {
-			// Not a batch insert or not handled, proceed with normal execution
+		// If it's not a batch insert scenario or another error occurred during splitting
+		if errors.Is(err, ErrSkipBatchHandler) || errors.Is(err, ErrInvalidInsertFormat) || errors.Is(err, ErrNoShardingKey) || errors.Is(err, ErrParameterMismatch) || errors.Is(err, ErrShardResolution) {
 			if DefaultLogLevel >= LogLevelTrace {
 				traceLog("Skipping batch handler for query: %s", query)
 			}
 			return nil, err
 		}
 
+		// If we received an error other than ErrSkipBatchHandler, log it.
+		// We no longer return the error here, allowing execution to proceed
+		// if queries and queryParams were successfully generated despite the error
+		// (specifically targeting the ErrInsertDiffSuffix case).
 		if DefaultLogLevel >= LogLevelDebug {
-			debugLog("Error splitting batch insert: %v (query: %s)", err, query)
+			debugLog("Error reported by SplitBatchInsertByShards (will attempt execution if possible): %v (query: %s)", err, query)
 		}
-		return nil, err
+	}
+
+	// Ensure queries were actually generated before proceeding
+	if len(queries) == 0 {
+		// If no queries were generated and there was no ErrSkipBatchHandler,
+		// it indicates an unexpected state or an error during splitting that didn't produce splits.
+		// Propagate the original error if it exists, otherwise return a generic error.
+		if err != nil && !errors.Is(err, ErrSkipBatchHandler) {
+			return nil, fmt.Errorf("batch insert splitting failed with error and produced no queries: %w", err)
+		} else {
+			// This case should ideally not be reached if SplitBatchInsertByShards behaves correctly
+			// (either returns ErrSkipBatchHandler, ErrInsertDiffSuffix with splits, or another error).
+			// Return ErrSkipBatchHandler to be safe and revert to standard processing.
+			return nil, ErrSkipBatchHandler
+		}
 	}
 
 	// Execute each query separately
 	var lastResult sql.Result
 	var rowsAffected int64
+	var firstErr error
 
 	for i, shardQuery := range queries {
+		shardSuffix := "unknown" // Placeholder in case keyGroup isn't easily accessible here
+		// Attempt to extract suffix for logging (best effort)
+		matches := suffixRegex.FindStringSubmatch(shardQuery) // Assuming suffixRegex exists and is suitable
+		if len(matches) > 1 {
+			shardSuffix = matches[1]
+		}
+
 		if DefaultLogLevel >= LogLevelDebug {
-			debugLog("Executing shard-specific batch insert (%d/%d): %s", i+1, len(queries), shardQuery)
+			debugLog("Executing shard-specific batch insert (%d/%d) for shard suffix '%s': %s | PARAMS: %v", i+1, len(queries), shardSuffix, shardQuery, queryParams[i])
 		}
 
 		result, err := ctx.execContext(shardQuery, queryParams[i]...)
 		if err != nil {
-			return nil, fmt.Errorf("error executing shard %d: %w", i, err)
+			detailedErr := fmt.Errorf("error executing shard query for suffix '%s' (index %d): %w", shardSuffix, i, err)
+			if firstErr == nil {
+				firstErr = detailedErr // Store the first error encountered
+			}
+			// Log the specific shard error
+			s.Logger.Error(context.Background(), detailedErr.Error())
+			continue // Continue processing other shards
 		}
 
 		// Keep track of rows affected for final result
@@ -687,7 +806,7 @@ func (s *Sharding) HandleBatchInsert(ctx *QueryContext, query string, args []int
 	return &batchResult{
 		lastResult:   lastResult,
 		rowsAffected: rowsAffected,
-	}, nil
+	}, firstErr
 }
 
 // batchResult implements the sql.Result interface to represent combined results

@@ -1,10 +1,14 @@
 package sharding
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/bwmarrin/snowflake"
 	"github.com/longbridgeapp/assert"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -198,4 +202,77 @@ func TestBatchInsertWithOnConflict(t *testing.T) {
 		assert.Nil(t, err, "Failed to find updated contract")
 		assert.Equal(t, 6, updatedContract.Flags, "Flags should be updated to 6")
 	})
+}
+
+func TestSplitBatchInsertWithOnConflict(t *testing.T) {
+	// Initialize snowflake nodes
+	node1, err := snowflake.NewNode(0)
+	assert.NoError(t, err, "Failed to create snowflake node 0")
+	node2, err := snowflake.NewNode(1)
+	assert.NoError(t, err, "Failed to create snowflake node 1")
+
+	// Setup Sharding instance manually
+	s := &Sharding{
+		configs: map[string]Config{
+			"orders": {
+				ShardingKey:         "user_id",
+				NumberOfShards:      2,
+				PrimaryKeyGenerator: PKSnowflake,
+				ShardingAlgorithm: func(key interface{}) (string, error) {
+					id, ok := key.(int)
+					if !ok {
+						return "", fmt.Errorf("invalid key type")
+					}
+					return fmt.Sprintf("_%d", id%2), nil
+				},
+			},
+		},
+		querys: sync.Map{},
+		mutex:  sync.RWMutex{},
+		globalIndices: &GlobalIndexRegistry{
+			// Corrected initialization for the nested map
+			indices: make(map[string]map[string]*GlobalIndex),
+		},
+		snowflakeNodes: []*snowflake.Node{node1, node2},
+		// Mock DB if needed, but SplitBatchInsert doesn't directly use it
+	}
+
+	// Sample data mapping to different shards
+	query := `INSERT INTO "orders" ("order_id", "user_id", "amount") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT ("order_id") DO UPDATE SET amount = excluded.amount`
+	args := []interface{}{101, 1, 50.0, 102, 2, 75.0} // user_id 1 -> shard _1, user_id 2 -> shard _0
+
+	// Mock ConnPoolExecer is needed for HandleBatchInsert
+	mockPool := &mockConnPoolExecer{}
+	queryCtx := &QueryContext{
+		Sharding: s,
+		ConnPool: mockPool,
+	}
+
+	// Execute the HandleBatchInsert function, which calls SplitBatchInsertByShards internally
+	_, err = s.HandleBatchInsert(queryCtx, query, args)
+
+	// Assertions (Green Phase - Expecting success now)
+	assert.NoError(t, err, "Expected no error after handling ON CONFLICT in batch insert")
+}
+
+// Mock implementation for ConnPoolExecer if needed for deeper testing
+type mockConnPoolExecer struct{}
+
+func (m *mockConnPoolExecer) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
+	// Basic mock implementation
+	return &mockSqlResult{rowsAffected: 1}, nil
+}
+
+// Mock implementation for sql.Result
+type mockSqlResult struct {
+	lastInsertId int64
+	rowsAffected int64
+}
+
+func (r *mockSqlResult) LastInsertId() (int64, error) {
+	return r.lastInsertId, nil
+}
+
+func (r *mockSqlResult) RowsAffected() (int64, error) {
+	return r.rowsAffected, nil
 }
