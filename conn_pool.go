@@ -134,12 +134,14 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 
 	// Double-write ensures data consistency during migration from non-sharded to sharded tables
 	if table != "" && err != nil && errors.Is(err, ErrMissingShardingKey) {
+		var doubleWrite bool // Declare outside lock
 		pool.sharding.mutex.RLock()
-		doubleWrite := true
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
+		} else {
+			doubleWrite = true // Default or handle error? Assuming default true if config missing.
 		}
-		pool.sharding.mutex.RUnlock()
+		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
 		// Fallback to original table maintains data availability even with incomplete sharding metadata
 		if doubleWrite {
@@ -158,12 +160,14 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 
 	// Writing to main table first creates a fallback data source in case of sharding issues
 	if table != "" {
+		var doubleWrite bool // Declare outside lock
 		pool.sharding.mutex.RLock()
-		doubleWrite := true
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
+		} else {
+			doubleWrite = true // Default or handle error? Assuming default true if config missing.
 		}
-		pool.sharding.mutex.RUnlock()
+		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
 		if doubleWrite {
 			// Re-check context to avoid wasted operations if request was cancelled during resolution
@@ -277,12 +281,14 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 
 	// Missing sharding key with double-write enabled allows fallback to original table
 	if table != "" && err != nil && errors.Is(err, ErrMissingShardingKey) {
+		var doubleWrite bool // Declare outside lock
 		pool.sharding.mutex.RLock()
-		doubleWrite := true
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
+		} else {
+			doubleWrite = true // Default or handle error? Assuming default true if config missing.
 		}
-		pool.sharding.mutex.RUnlock()
+		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
 		if doubleWrite {
 			pool.sharding.querys.Store("last_query", query)
@@ -310,12 +316,14 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 	// Different handling for INSERT vs SELECT prevents unnecessary writes for read-only operations
 	isInsert := strings.Contains(strings.ToUpper(query), "INSERT INTO")
 	if isInsert && table != "" {
+		var doubleWrite bool // Declare outside lock
 		pool.sharding.mutex.RLock()
-		doubleWrite := true
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
+		} else {
+			doubleWrite = true // Default or handle error? Assuming default true if config missing.
 		}
-		pool.sharding.mutex.RUnlock()
+		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
 		if doubleWrite {
 			// Context check prevents wasted operations for cancelled requests
@@ -391,12 +399,14 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 
 	// Double-write fallback ensures queries succeed even with missing sharding keys
 	if table != "" && err != nil && errors.Is(err, ErrMissingShardingKey) {
+		var doubleWrite bool // Declare outside lock
 		pool.sharding.mutex.RLock()
-		doubleWrite := true
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
+		} else {
+			doubleWrite = true // Default or handle error? Assuming default true if config missing.
 		}
-		pool.sharding.mutex.RUnlock()
+		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
 		if doubleWrite {
 			return pool.ConnPool.QueryRowContext(ctx, ftQuery, args...)
@@ -412,12 +422,14 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 
 	// Double-write for INSERTs keeps both tables in sync during migration periods
 	if isInsert && table != "" && err == nil {
+		var doubleWrite bool // Declare outside lock
 		pool.sharding.mutex.RLock()
-		doubleWrite := true
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
+		} else {
+			doubleWrite = true // Default or handle error? Assuming default true if config missing.
 		}
-		pool.sharding.mutex.RUnlock()
+		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
 		if doubleWrite {
 			// QueryContext instead of QueryRowContext enables proper resource/error management
