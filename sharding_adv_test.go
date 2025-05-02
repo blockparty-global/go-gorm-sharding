@@ -904,4 +904,198 @@ func TestUnionQueriesWithSharding(t *testing.T) {
 				result.Address, result.Name, result.Type)
 		}
 	})
+
+	// Test 7: Nested UNION query
+	t.Run("NestedUnion", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Union ERC20 (contract 0, shard 1), ERC721 (contract 1, shard 3), and ERC1155 (contract 2, shard 1)
+		err := testDB.Raw(`
+			(SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? AND type = 'ERC20')
+			UNION
+			(SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? AND type = 'ERC721')
+			UNION
+			(SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? AND type = 'ERC1155')
+		`, contracts[0].Address, contracts[1].Address, contracts[2].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "Nested UNION query should succeed")
+		t.Logf("Found %d results with nested UNION query", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Should target shards _1 and _3
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+		tassert.Equal(t, 3, len(results), "Should find 3 distinct contracts")
+	})
+
+	// Test 8: UNION targeting different shards explicitly
+	t.Run("UnionDifferentShards", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Contract 0 -> Shard 1
+		// Contract 1 -> Shard 3
+		// Contract 2 -> Shard 1
+		// Contract 3 -> Shard 1
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 1
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 3
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 1
+		`, contracts[0].Address, contracts[1].Address, contracts[2].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL targeting different shards should succeed")
+		t.Logf("Found %d results with UNION ALL targeting different shards", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Should target shards _1 and _3
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+		tassert.Equal(t, 3, len(results), "Should find 3 contracts")
+	})
+
+	// Test 9: UNION with Aggregation (GROUP BY)
+	t.Run("UnionWithAggregation", func(t *testing.T) {
+		var results []struct {
+			Type  string
+			Count int
+		}
+
+		// Count ERC20s in shard 1 (contracts 0 & 3) and ERC721s in shard 3 (contract 1)
+		err := testDB.Raw(`
+			SELECT type, count(*) as count FROM contract_with_hash_partitions WHERE address = ? GROUP BY type -- Shard 1 (ERC20)
+			UNION ALL
+			SELECT type, count(*) as count FROM contract_with_hash_partitions WHERE address = ? GROUP BY type -- Shard 3 (ERC721)
+			UNION ALL
+			SELECT type, count(*) as count FROM contract_with_hash_partitions WHERE address = ? GROUP BY type -- Shard 1 (ERC20)
+		`, contracts[0].Address, contracts[1].Address, contracts[3].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL with aggregation should succeed")
+		t.Logf("Found %d aggregated results", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Should target shards _1 and _3
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+
+		// Verify counts (expecting 2 ERC20 results from shard 1, 1 ERC721 from shard 3)
+		erc20Count := 0
+		erc721Count := 0
+		for _, r := range results {
+			t.Logf("Found aggregated result: Type=%s, Count=%d", r.Type, r.Count)
+			if r.Type == "ERC20" {
+				erc20Count += r.Count
+			} else if r.Type == "ERC721" {
+				erc721Count += r.Count
+			}
+		}
+		// Note: The UNION ALL combines results *before* final aggregation by the DB if not grouped outside.
+		// Here, each part is grouped, so we expect counts per part.
+		tassert.Equal(t, 2, erc20Count, "Should have counted 2 ERC20 contracts")  // contracts[0] and contracts[3]
+		tassert.Equal(t, 1, erc721Count, "Should have counted 1 ERC721 contract") // contracts[1]
+	})
+
+	// Test 10: UNION with one part missing sharding key (requires DoubleWrite)
+	t.Run("UnionWithMissingKeyDoubleWrite", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Contract 0 -> Shard 1
+		// Type ERC1155 -> Contract 2 -> Shard 1 (but no address key provided)
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 1
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE type = 'ERC1155' -- No sharding key, relies on DoubleWrite
+		`, contracts[0].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL with missing key (DoubleWrite) should succeed")
+		t.Logf("Found %d results with missing key UNION ALL", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Because the second part has no key and DoubleWrite is true, it should query ALL shards.
+		// The first part targets shard 1. So, the final query should hit all shards (_0, _1, _2, _3).
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_0", "Query should target shard 0")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_2", "Query should target shard 2")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+
+		// We expect Contract 0 (ERC20, Shard 1) and Contract 2 (ERC1155, Shard 1)
+		foundContract0 := false
+		foundContract2 := false
+		for _, r := range results {
+			if r.Address == contracts[0].Address {
+				foundContract0 = true
+			}
+			if r.Address == contracts[2].Address {
+				foundContract2 = true
+			}
+		}
+		tassert.True(t, foundContract0, "Should find contract 0")
+		tassert.True(t, foundContract2, "Should find contract 2")
+		// Depending on UNION ALL behavior, contract 0 might appear twice if present in both parts' results across shards.
+		// Let's check we have at least 2 results.
+		tassert.GreaterOrEqual(t, len(results), 2, "Should find at least 2 results")
+
+	})
+
+	// Test 11: UNION where one part is missing the sharding key (address)
+	t.Run("UnionMissingShardingKeyDifferentFilters", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Contract 1 (TokenB, ERC721) -> Shard 3
+		// Type ERC20 -> Contracts 0 & 3 -> Shards 1 & 1 (but key missing, so should hit all shards)
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 3 (Key present)
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE type = 'ERC20' -- No address key, should hit all shards due to DoubleWrite
+		`, contracts[1].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL with one part missing sharding key should succeed")
+		t.Logf("Found %d results with missing key UNION ALL (different filters)", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// The first part targets shard 3.
+		// The second part targets all shards (_0, _1, _2, _3) because the key is missing and DoubleWrite=true.
+		// The final query should be a UNION ALL across all shards.
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_0", "Query should target shard 0")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_2", "Query should target shard 2")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+
+		// We expect Contract 1 (TokenB, ERC721, Shard 3) from the first part.
+		// We expect Contract 0 (TokenA, ERC20, Shard 1) and Contract 3 (TokenD, ERC20, Shard 1) from the second part.
+		foundContract0 := false
+		foundContract1 := false
+		foundContract3 := false
+		for _, r := range results {
+			if r.Address == contracts[0].Address {
+				foundContract0 = true
+			}
+			if r.Address == contracts[1].Address {
+				foundContract1 = true
+			}
+			if r.Address == contracts[3].Address {
+				foundContract3 = true
+			}
+		}
+		tassert.True(t, foundContract0, "Should find contract 0 (TokenA)")
+		tassert.True(t, foundContract1, "Should find contract 1 (TokenB)")
+		tassert.True(t, foundContract3, "Should find contract 3 (TokenD)")
+		tassert.GreaterOrEqual(t, len(results), 3, "Should find at least 3 results")
+	})
 }
