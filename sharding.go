@@ -1604,9 +1604,9 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 	} else {
 		// 'id' is not present in insert columns
 		if r.PrimaryKeyGeneratorFn != nil {
-			generatedID := r.PrimaryKeyGeneratorFn(int64(shardIndex))
-			if generatedID != 0 {
-				// Proceed to add 'id' column and value
+			// Generate ID inside the loop for each row if needed
+			if r.PrimaryKeyGeneratorFn != nil {
+				// Add the 'id' column definition if it wasn't present
 				log.Println("'id' column not present in insert columns; adding it.")
 				insertStmt.Cols = append(insertStmt.Cols, &pg_query.Node{
 					Node: &pg_query.Node_ResTarget{
@@ -1630,25 +1630,34 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 					return fmt.Errorf("insert statement has no VALUES list")
 				}
 
-				for _, valuesList := range valuesSelect.ValuesLists {
+				// Iterate through each VALUES list to assign a UNIQUE ID
+				for _, valuesList := range valuesSelect.ValuesLists { // Loop starts here
 					listNode, ok := valuesList.Node.(*pg_query.Node_List)
 					if !ok {
 						return fmt.Errorf("unsupported values list type when assigning id")
 					}
 
-					// Append the generated ID to the VALUES list
+					// Generate a NEW unique ID for EACH row in the batch
+					uniqueGeneratedID := r.PrimaryKeyGeneratorFn(int64(shardIndex))
+					// Removed the block that skipped adding ID if it was 0
+					// We always want to add the generated value, even if it's 0
+
+					// Append the unique generated ID to this specific VALUES list
+					// Ensure a distinct A_Const node is created for each row's ID
 					listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
 						Node: &pg_query.Node_AConst{
 							AConst: &pg_query.A_Const{
 								Val: &pg_query.A_Const_Ival{
-									Ival: &pg_query.Integer{Ival: int32(generatedID)},
+									// Create a new Integer struct for each ID
+									Ival: &pg_query.Integer{Ival: int32(uniqueGeneratedID)},
 								},
+								Location: -1, // Force quoting/handling as constant
 							},
 						},
 					})
 				}
 			}
-			// Else, generatedID == 0, so we skip adding 'id' column
+			// Else, PrimaryKeyGeneratorFn is nil, so we skip adding 'id' column
 		}
 	}
 
