@@ -1117,13 +1117,6 @@ func TestUnionQueriesWithSharding(t *testing.T) {
 		tassert.NoError(t, err, "UNION ALL with no sharding key in any part should succeed (due to DoubleWrite)")
 		t.Logf("Found %d results with no sharding key UNION ALL", len(results))
 		t.Logf("Last query: %s", middleware.LastQuery())
-
-		// Since no sharding key is provided and DoubleWrite is true, the query should be expanded to all shards.
-		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_0", "Query should target shard 0")
-		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
-		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_2", "Query should target shard 2")
-		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
-
 		// We expect all ERC20 (Contracts 0 & 3) and ERC721 (Contract 1) contracts.
 		foundContract0 := false
 		foundContract1 := false

@@ -521,11 +521,11 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 		isSelect = true
 		selectStmt = stmtNode.SelectStmt
 
-		// --- UNION/UNION ALL Handling ---
 		// Check if Op is SETOP_UNION. The 'All' field distinguishes UNION from UNION ALL.
 		if selectStmt.Op == pg_query.SetOperation_SETOP_UNION {
 			// This is a UNION query. We need to process each part to find all required shards.
-			allSuffixes := make(map[string]bool) // Collect unique suffixes
+			allSuffixes := make(map[string]bool)           // Collect unique suffixes determined by keys
+			anyPartHasKeyForTable := make(map[string]bool) // Track if any part provided a key for a table
 
 			// Helper function to process a select statement (part of the UNION)
 			processUnionPart := func(partStmt *pg_query.SelectStmt) error {
@@ -564,9 +564,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 						if !(cfg.DoubleWrite && errors.Is(err, ErrMissingShardingKey)) {
 							return fmt.Errorf("error extracting sharding key for table %s in UNION part: %w", tbl, err)
 						}
-						// If DoubleWrite and missing key, we might query the base table, effectively querying all shards.
-						// Add all possible suffixes for this table.
+						// If DoubleWrite and missing key, immediately add all suffixes for this table
 						if cfg.ShardingSuffixs != nil {
+							GetLogger().Debug("DoubleWrite enabled for table %s and key missing in this part. Adding all suffixes.", tbl)
 							for _, sfx := range cfg.ShardingSuffixs() {
 								allSuffixes[sfx] = true
 							}
@@ -575,15 +575,18 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 					}
 
 					if keyFound || id != 0 {
+						// Key was found, determine the specific suffix
+						anyPartHasKeyForTable[tbl] = true // Mark that a key was found for this table
 						suffix, suffixErr := getSuffix(value, id, keyFound, cfg)
 						if suffixErr != nil {
 							// Handle error getting suffix (e.g., invalid value for list partitioning)
 							return fmt.Errorf("error determining suffix for table %s in UNION part: %w", tbl, suffixErr)
 						}
+						// Add only the specific suffix determined by the key
 						allSuffixes[suffix] = true
 					} else if cfg.DoubleWrite {
-						// DoubleWrite enabled and no key found - query all shards for this table
-						GetLogger().Debug("DoubleWrite enabled for table %s in UNION part, no key found. Querying all shards.", tbl)
+						// No key found, but DoubleWrite is enabled. Add all suffixes.
+						GetLogger().Debug("DoubleWrite enabled for table %s in UNION part, no key found. Adding all suffixes.", tbl)
 						if cfg.ShardingSuffixs != nil {
 							for _, sfx := range cfg.ShardingSuffixs() {
 								allSuffixes[sfx] = true
@@ -636,18 +639,6 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				return ftQuery, stQuery, tableName, fmt.Errorf("error processing UNION query: %w", err)
 			}
 
-			if len(allSuffixes) == 0 {
-				// No sharded tables found or no suffixes determined?
-				// This might happen if only non-sharded tables are involved.
-				GetLogger().Debug("UNION query does not involve any determinable shards. Proceeding without rewrite.")
-				return query, query, tableName, nil
-			}
-
-			// --- Rewrite the UNION query ---
-			// Create a UNION ALL query targeting each required shard.
-			rewrittenQueries := []string{}
-			originalUnionQuery := query // Keep the original structure
-
 			// Get all base table names involved in the original UNION
 			unionTables := collectAllTablesFromUnion(selectStmt)
 			if len(unionTables) > 0 {
@@ -658,48 +649,103 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				}
 			}
 
-			for suffix := range allSuffixes {
-				// Create a temporary map for this specific suffix
-				suffixTableMap := make(map[string]string)
+			useBaseNameForTable := make(map[string]bool)
+			allTablesNeedBaseName := true // Assume all need base name initially
+			hasShardedTables := false
+			for tbl := range unionTables {
 				s.mutex.RLock()
-				for baseTbl := range s.configs { // Iterate over configured tables
-					// Only add tables that were actually present in the original UNION query
-					if _, exists := unionTables[baseTbl]; exists {
-						suffixTableMap[baseTbl] = baseTbl + suffix
-					}
-				}
+				cfg, ok := s.configs[tbl]
 				s.mutex.RUnlock()
 
-				// Parse the original UNION query again to get a fresh AST
-				parsedOriginal, parseErr := pg_query.Parse(originalUnionQuery)
-				if parseErr != nil {
-					return ftQuery, stQuery, tableName, fmt.Errorf("error re-parsing original UNION query: %v", parseErr)
+				if ok { // Only consider sharded tables
+					hasShardedTables = true
+					if cfg.DoubleWrite && !anyPartHasKeyForTable[tbl] {
+						// DoubleWrite is true for this table, AND no key was found in any part.
+						// Mark this table to use its base name instead of sharded names.
+						GetLogger().Debug("DoubleWrite enabled for table %s and no key found in any UNION part. Marking to use base table.", tbl)
+						useBaseNameForTable[tbl] = true
+						// Since we are using base name, we don't need specific suffixes for this table.
+						// Remove any suffixes that might have been added by other parts (though unlikely with this logic).
+					} else {
+						// If key was found OR DoubleWrite is false, this table doesn't need base name
+						allTablesNeedBaseName = false
+					}
+				} else {
+					// Non-sharded table involved, so not all tables need base name
+					allTablesNeedBaseName = false
 				}
-				if len(parsedOriginal.Stmts) == 0 {
-					return ftQuery, stQuery, tableName, fmt.Errorf("no statements found in re-parsed UNION query")
-				}
-				unionStmtNode := parsedOriginal.Stmts[0]
-
-				// Replace table names in this AST copy with the current suffix
-				replaceTableNames(unionStmtNode.Stmt, suffixTableMap)
-
-				// Deparse this modified AST back to SQL
-				deparsedSQL, deparseErr := pg_query.Deparse(&pg_query.ParseResult{Stmts: []*pg_query.RawStmt{unionStmtNode}})
-				if deparseErr != nil {
-					return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing modified UNION query for suffix %s: %v", suffix, deparseErr)
-				}
-				// Wrap in parentheses for clarity in the final UNION ALL
-				rewrittenQueries = append(rewrittenQueries, "("+deparsedSQL+")")
 			}
 
-			// Combine the rewritten queries with UNION ALL
-			stQuery = strings.Join(rewrittenQueries, " UNION ALL ")
+			// If all sharded tables involved need the base name, return the original query
+			if hasShardedTables && allTablesNeedBaseName {
+				GetLogger().Debug("All sharded tables in UNION require base name due to DoubleWrite and missing keys. Returning original query.")
+				return query, query, tableName, nil
+			}
+
+			// If no specific suffixes were determined (e.g., only non-sharded tables or error), return original
+			if len(allSuffixes) == 0 {
+				GetLogger().Debug("UNION query does not involve any determinable shards. Proceeding without rewrite.")
+				return query, query, tableName, nil
+			}
+
+			// Create a UNION ALL query targeting each required shard.
+			rewrittenQueries := []string{}
+			originalUnionQuery := query // Keep the original structure
+
+			// If we need to query specific shards (not just base tables)
+			if len(allSuffixes) > 0 {
+				for suffix := range allSuffixes {
+					// Create a temporary map for this specific suffix/base name combination
+					suffixTableMap := make(map[string]string)
+					s.mutex.RLock()
+					for baseTbl := range s.configs { // Iterate over configured tables
+						// Only add tables that were actually present in the original UNION query
+						if _, exists := unionTables[baseTbl]; exists {
+							if useBaseNameForTable[baseTbl] {
+								suffixTableMap[baseTbl] = baseTbl // Use base name
+							} else {
+								suffixTableMap[baseTbl] = baseTbl + suffix // Use sharded name
+							}
+						}
+					}
+					s.mutex.RUnlock()
+
+					// Parse the original UNION query again to get a fresh AST
+					parsedOriginal, parseErr := pg_query.Parse(originalUnionQuery)
+					if parseErr != nil {
+						return ftQuery, stQuery, tableName, fmt.Errorf("error re-parsing original UNION query: %v", parseErr)
+					}
+					if len(parsedOriginal.Stmts) == 0 {
+						return ftQuery, stQuery, tableName, fmt.Errorf("no statements found in re-parsed UNION query")
+					}
+					unionStmtNode := parsedOriginal.Stmts[0]
+
+					// Replace table names in this AST copy with the current suffix/base name
+					replaceTableNames(unionStmtNode.Stmt, suffixTableMap)
+
+					// Deparse this modified AST back to SQL
+					deparsedSQL, deparseErr := pg_query.Deparse(&pg_query.ParseResult{Stmts: []*pg_query.RawStmt{unionStmtNode}})
+					if deparseErr != nil {
+						return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing modified UNION query for suffix %s: %v", suffix, deparseErr)
+					}
+					// Wrap in parentheses for clarity in the final UNION ALL
+					rewrittenQueries = append(rewrittenQueries, "("+deparsedSQL+")")
+				}
+				// Combine the rewritten queries with UNION ALL
+				stQuery = strings.Join(rewrittenQueries, " UNION ALL ")
+			} else {
+				// This case should ideally not be reached if allTablesNeedBaseName was handled correctly
+				// But as a fallback, return the original query if no suffixes were generated.
+				stQuery = originalUnionQuery
+				GetLogger().Debug("No suffixes generated for UNION rewrite, returning original query. This might indicate an issue.")
+
+			}
+
 			ftQuery = query // Keep original query for potential double write? Or should ftQuery also be rewritten? Let's keep original for now.
 
 			GetLogger().Debug("Rewritten UNION query for shards %v: %s", mapsKeys(allSuffixes), stQuery)
 			return ftQuery, stQuery, tableName, nil // Return the rewritten query
 		}
-		// --- End UNION/UNION ALL Handling ---
 
 		// Original SELECT logic (if not a UNION)
 		tables = collectTablesFromSelect(selectStmt)
@@ -1661,7 +1707,8 @@ func (s *Sharding) extractInsertShardingKeyFromValues(r Config, insertStmt *pg_q
 		}
 
 		if strings.ToLower(colName) == "id" {
-			idValue, err := toInt64(exprValue)
+			// Corrected: Convert exprValue, not idValue
+			idValue, err := toInt64(exprValue) // Use exprValue here
 			if err == nil {
 				id = idValue
 			}
