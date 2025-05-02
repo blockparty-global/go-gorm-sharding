@@ -1098,4 +1098,55 @@ func TestUnionQueriesWithSharding(t *testing.T) {
 		tassert.True(t, foundContract3, "Should find contract 3 (TokenD)")
 		tassert.GreaterOrEqual(t, len(results), 3, "Should find at least 3 results")
 	})
+
+	// Test 12: UNION where *no* part includes the sharding key (address)
+	t.Run("UnionNoShardingKey", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Select ERC20 and ERC721 contracts without specifying address
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE type = 'ERC20'
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE type = 'ERC721'
+		`).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL with no sharding key in any part should succeed (due to DoubleWrite)")
+		t.Logf("Found %d results with no sharding key UNION ALL", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Since no sharding key is provided and DoubleWrite is true, the query should be expanded to all shards.
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_0", "Query should target shard 0")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_2", "Query should target shard 2")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+
+		// We expect all ERC20 (Contracts 0 & 3) and ERC721 (Contract 1) contracts.
+		foundContract0 := false
+		foundContract1 := false
+		foundContract3 := false
+		for _, r := range results {
+			if r.Address == contracts[0].Address {
+				foundContract0 = true
+			}
+			if r.Address == contracts[1].Address {
+				foundContract1 = true
+			}
+			if r.Address == contracts[3].Address {
+				foundContract3 = true
+			}
+		}
+		tassert.True(t, foundContract0, "Should find contract 0 (TokenA)")
+		tassert.True(t, foundContract1, "Should find contract 1 (TokenB)")
+		tassert.True(t, foundContract3, "Should find contract 3 (TokenD)")
+		// Expect 3 results because UNION ALL doesn't remove duplicates between the two SELECTs if they were on different shards,
+		// but the final DB execution might consolidate if the same row exists on multiple queried shards.
+		// Given the setup, contracts 0 & 3 are ERC20 (both hash to shard 1), contract 1 is ERC721 (hashes to shard 3).
+		// The query hits all shards. Shard 1 returns A & D. Shard 3 returns B. Other shards return nothing.
+		// Total unique rows = 3.
+		tassert.Equal(t, 3, len(results), "Should find exactly 3 results")
+	})
 }
