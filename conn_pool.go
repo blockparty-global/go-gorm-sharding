@@ -139,7 +139,7 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
 		} else {
-			doubleWrite = true // Default or handle error? Assuming default true if config missing.
+			doubleWrite = true
 		}
 		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
@@ -165,7 +165,7 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
 		} else {
-			doubleWrite = true // Default or handle error? Assuming default true if config missing.
+			doubleWrite = true
 		}
 		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
@@ -286,7 +286,7 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
 		} else {
-			doubleWrite = true // Default or handle error? Assuming default true if config missing.
+			doubleWrite = true
 		}
 		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
@@ -321,7 +321,7 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
 		} else {
-			doubleWrite = true // Default or handle error? Assuming default true if config missing.
+			doubleWrite = true
 		}
 		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
@@ -404,7 +404,7 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
 		} else {
-			doubleWrite = true // Default or handle error? Assuming default true if config missing.
+			doubleWrite = true
 		}
 		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
@@ -427,7 +427,7 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 		if r, ok := pool.sharding.configs[table]; ok {
 			doubleWrite = r.DoubleWrite
 		} else {
-			doubleWrite = true // Default or handle error? Assuming default true if config missing.
+			doubleWrite = true
 		}
 		pool.sharding.mutex.RUnlock() // Release lock before potentially executing query
 
