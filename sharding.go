@@ -447,6 +447,11 @@ func (s *Sharding) switchConn(db *gorm.DB) {
 
 // resolve splits the old query into full table query and sharding table query
 func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery, tableName string, err error) {
+	// Acquire read lock at the beginning
+	s.mutex.RLock()
+	// Defer unlock to ensure it's released even on error paths
+	defer s.mutex.RUnlock()
+
 	// Initialize return values to avoid nil pointers
 	ftQuery = query
 	stQuery = query
@@ -457,12 +462,13 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 	// Check if s.configs is nil or empty
 	if s == nil || s.configs == nil {
+		// Release lock before returning
+		// s.mutex.RUnlock() // Defer handles this
 		return query, query, tableName, nil
 	}
 
-	s.mutex.RLock()
 	configsCount := len(s.configs)
-	for baseTable, config := range s.configs {
+	for baseTable, config := range s.configs { // Safe under RLock
 		// Safely get sharding suffixes, handling nil cases
 		var suffixes []string
 		if config.ShardingSuffixs != nil {
@@ -478,12 +484,12 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				tableName = baseTable
 				ftQuery = query
 				stQuery = query
-				s.mutex.RUnlock()
+				// s.mutex.RUnlock() // Removed explicit unlock, defer handles it
 				return
 			}
 		}
 	}
-	s.mutex.RUnlock()
+	// s.mutex.RUnlock() // Removed explicit unlock, defer handles it
 
 	// If configs is empty, return the query as-is
 	if configsCount == 0 {
@@ -533,9 +539,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				partConditions := collectConditionsFromSelect(partStmt) // Collect conditions including JOINs
 
 				for _, tbl := range partTables {
-					s.mutex.RLock()
+					// s.mutex.RLock() // Already holding RLock from start of resolve
 					cfg, ok := s.configs[tbl]
-					s.mutex.RUnlock()
+					// s.mutex.RUnlock() // Don't unlock here
 					if !ok {
 						continue // Skip non-sharded tables in this part
 					}
@@ -653,9 +659,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			allTablesNeedBaseName := true // Assume all need base name initially
 			hasShardedTables := false
 			for tbl := range unionTables {
-				s.mutex.RLock()
+				// s.mutex.RLock() // Already holding RLock
 				cfg, ok := s.configs[tbl]
-				s.mutex.RUnlock()
+				// s.mutex.RUnlock() // Don't unlock here
 
 				if ok { // Only consider sharded tables
 					hasShardedTables = true
@@ -697,7 +703,7 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				for suffix := range allSuffixes {
 					// Create a temporary map for this specific suffix/base name combination
 					suffixTableMap := make(map[string]string)
-					s.mutex.RLock()
+					// s.mutex.RLock() // Already holding RLock
 					for baseTbl := range s.configs { // Iterate over configured tables
 						// Only add tables that were actually present in the original UNION query
 						if _, exists := unionTables[baseTbl]; exists {
@@ -708,7 +714,7 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 							}
 						}
 					}
-					s.mutex.RUnlock()
+					// s.mutex.RUnlock() // Don't unlock here
 
 					// Parse the original UNION query again to get a fresh AST
 					parsedOriginal, parseErr := pg_query.Parse(originalUnionQuery)
@@ -760,9 +766,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 		if isSelect && len(conditions) > 0 {
 			hasShardingKey := false
 			for _, table := range tables {
-				s.mutex.RLock()
+				// s.mutex.RLock() // Already holding RLock
 				cfg, ok := s.configs[table]
-				s.mutex.RUnlock()
+				// s.mutex.RUnlock() // Don't unlock here
 
 				if ok {
 					shardingKey := cfg.ShardingKey
@@ -805,9 +811,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 						// For tables with DoubleWrite enabled, try to determine the appropriate sharded table
 						for _, table := range tables {
-							s.mutex.RLock()
+							// s.mutex.RLock() // Already holding RLock
 							cfg, ok := s.configs[table]
-							s.mutex.RUnlock()
+							// s.mutex.RUnlock() // Don't unlock here
 							if ok && cfg.DoubleWrite {
 								// Create a map to store known keys for this extraction
 								localKnownKeys := make(map[string]interface{})
@@ -855,9 +861,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				// Check DoubleWrite before returning ErrMissingShardingKey for SELECT
 				canUseBaseTable := false
 				if tableName != "" { // Ensure we have a table name to check config
-					s.mutex.RLock()
+					// s.mutex.RLock() // Already holding RLock
 					cfg, ok := s.configs[tableName]
-					s.mutex.RUnlock()
+					// s.mutex.RUnlock() // Don't unlock here
 					if ok && cfg.DoubleWrite {
 						canUseBaseTable = true
 					}
@@ -942,9 +948,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			fullTableName = fmt.Sprintf("%s.%s", schemaName, localTableName)
 		}
 
-		s.mutex.RLock()
+		// s.mutex.RLock() // Already holding RLock
 		r, ok := s.configs[fullTableName]
-		s.mutex.RUnlock()
+		// s.mutex.RUnlock() // Don't unlock here
 
 		if !ok {
 			continue // Skip tables not configured for sharding
@@ -1098,9 +1104,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			value, id, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, aliasMap, fullTableName)
 
 			// Get the config again for DoubleWrite check
-			s.mutex.RLock()
+			// s.mutex.RLock() // Already holding RLock
 			cfg, configOk := s.configs[fullTableName]
-			s.mutex.RUnlock()
+			// s.mutex.RUnlock() // Don't unlock here
 
 			// Determine suffix and update tableMap
 			if keyFound || (id != 0) { // Sharding key or ID found (even if err != nil, keyFound might be true from LOWER)
@@ -1129,9 +1135,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 							continue // Skip self
 						}
 
-						s.mutex.RLock()
+						// s.mutex.RLock() // Already holding RLock
 						joinedCfg, joinedOk := s.configs[joinedTable]
-						s.mutex.RUnlock()
+						// s.mutex.RUnlock() // Don't unlock here
 
 						if joinedOk {
 							joinedShardingKey := joinedCfg.ShardingKey
