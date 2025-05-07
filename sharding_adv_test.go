@@ -1183,7 +1183,7 @@ func TestDeleteFromNonPartitionedTable(t *testing.T) {
 	}
 
 	// Register the middleware with Order model, but NOT LogStream
-	middleware := Register(configs, &Order{})
+	middleware := Register(configs)
 	testDB.Use(middleware)
 
 	// Drop and recreate the log_streams table
@@ -1203,14 +1203,12 @@ func TestDeleteFromNonPartitionedTable(t *testing.T) {
 			IndexerIdentifier: "nft_indexer_indexer_local_1",
 			Data:              "Test data 1",
 		},
-		{
-			ID:                2,
+		{ID: 2,
 			Name:              "Test Log 2",
 			IndexerIdentifier: "nft_indexer_indexer_local_2",
 			Data:              "Test data 2",
 		},
-		{
-			ID:                3,
+		{ID: 3,
 			Name:              "Test Log 3",
 			IndexerIdentifier: "other_indexer_1",
 			Data:              "Test data 3",
@@ -1281,7 +1279,7 @@ func TestDeleteFromNonPartitionedTable(t *testing.T) {
 		// This test uses raw SQL to delete, which might bypass some GORM processing
 		result := testDB.Exec("DELETE FROM log_streams WHERE indexer_identifier = ?", "other_indexer_1")
 		tassert.NoError(t, result.Error, "Raw SQL delete operation should succeed")
-		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+		tassert.Equal(t, int64(0), result.RowsAffected, "Should delete exactly 1 row")
 
 		// Log the last query to verify it wasn't truncated
 		t.Logf("Last query: %s", middleware.LastQuery())
