@@ -1144,3 +1144,151 @@ func TestUnionQueriesWithSharding(t *testing.T) {
 		tassert.Equal(t, 3, len(results), "Should find exactly 3 results")
 	})
 }
+
+// LogStream represents a non-partitioned table for testing DELETE operations
+type LogStream struct {
+	ID                int64  `gorm:"primarykey"`
+	Name              string `gorm:"index:idx_name"`
+	IndexerIdentifier string `gorm:"index:idx_indexer_identifier"`
+	Data              string
+}
+
+// TableName specifies the table name for LogStream
+func (LogStream) TableName() string {
+	return "log_streams"
+}
+
+// TestDeleteFromNonPartitionedTable tests that DELETE operations on non-partitioned tables
+// are executed correctly without being truncated
+func TestDeleteFromNonPartitionedTable(t *testing.T) {
+	// Create a test DB with proper configuration
+	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
+	})
+	if err != nil {
+		t.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	// Register cleanup function
+	t.Cleanup(func() {
+		// Drop the test table after test completion
+		testDB.Exec("DROP TABLE IF EXISTS log_streams")
+	})
+
+	// Create a sharding middleware with configurations for other tables (not log_streams)
+	// This simulates the real-world scenario where some tables are sharded and others are not
+	configs := map[string]Config{
+		"orders": shardingConfig, // Use existing config from test setup
+	}
+
+	// Register the middleware with Order model, but NOT LogStream
+	middleware := Register(configs, &Order{})
+	testDB.Use(middleware)
+
+	// Drop and recreate the log_streams table
+	testDB.Exec("DROP TABLE IF EXISTS log_streams")
+
+	// Auto migrate to create the table
+	err = testDB.AutoMigrate(&LogStream{})
+	if err != nil {
+		t.Fatalf("Failed to migrate log_streams table: %v", err)
+	}
+
+	// Insert test data
+	testLogs := []LogStream{
+		{
+			ID:                1,
+			Name:              "Test Log 1",
+			IndexerIdentifier: "nft_indexer_indexer_local_1",
+			Data:              "Test data 1",
+		},
+		{
+			ID:                2,
+			Name:              "Test Log 2",
+			IndexerIdentifier: "nft_indexer_indexer_local_2",
+			Data:              "Test data 2",
+		},
+		{
+			ID:                3,
+			Name:              "Test Log 3",
+			IndexerIdentifier: "other_indexer_1",
+			Data:              "Test data 3",
+		},
+	}
+
+	// Insert the test logs
+	for _, log := range testLogs {
+		err := testDB.Create(&log).Error
+		tassert.NoError(t, err, "Failed to insert log stream")
+		t.Logf("Created log stream with ID %d, Name %s, IndexerIdentifier %s",
+			log.ID, log.Name, log.IndexerIdentifier)
+	}
+
+	// Verify data was inserted
+	var count int64
+	testDB.Model(&LogStream{}).Count(&count)
+	tassert.Equal(t, int64(3), count, "Should have 3 log streams inserted")
+
+	// Test 1: Delete with a simple condition
+	t.Run("DeleteWithSimpleCondition", func(t *testing.T) {
+		result := testDB.Where("name = ?", "Test Log 1").Delete(&LogStream{})
+		tassert.NoError(t, result.Error, "Delete operation should succeed")
+		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+
+		// Log the last query to verify it wasn't truncated
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify the record was deleted
+		var remainingCount int64
+		testDB.Model(&LogStream{}).Count(&remainingCount)
+		tassert.Equal(t, int64(2), remainingCount, "Should have 2 log streams remaining")
+	})
+	// Test 1: Delete with a simple ID
+	t.Run("DeleteWithSimpleCondition", func(t *testing.T) {
+		result := testDB.Where("id = ?", 1).Delete(&LogStream{})
+		tassert.NoError(t, result.Error, "Delete operation should succeed")
+		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+
+		// Log the last query to verify it wasn't truncated
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify the record was deleted
+		var remainingCount int64
+		testDB.Model(&LogStream{}).Count(&remainingCount)
+		tassert.Equal(t, int64(2), remainingCount, "Should have 2 log streams remaining")
+	})
+
+	// Test 2: Delete with a complex condition including the problematic field
+	t.Run("DeleteWithComplexCondition", func(t *testing.T) {
+		// This test specifically targets the issue mentioned by the user
+		// where DELETE statements with conditions on indexer_identifier are getting truncated
+		result := testDB.Where("indexer_identifier LIKE ?", "nft_indexer_indexer_local_%").Delete(&LogStream{})
+		tassert.NoError(t, result.Error, "Delete operation should succeed")
+		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+
+		// Log the last query to verify it wasn't truncated
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify the record was deleted
+		var remainingCount int64
+		testDB.Model(&LogStream{}).Count(&remainingCount)
+		tassert.Equal(t, int64(1), remainingCount, "Should have 1 log stream remaining")
+	})
+
+	// Test 3: Delete with a raw SQL query
+	t.Run("DeleteWithRawSQL", func(t *testing.T) {
+		// This test uses raw SQL to delete, which might bypass some GORM processing
+		result := testDB.Exec("DELETE FROM log_streams WHERE indexer_identifier = ?", "other_indexer_1")
+		tassert.NoError(t, result.Error, "Raw SQL delete operation should succeed")
+		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+
+		// Log the last query to verify it wasn't truncated
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify all records were deleted
+		var remainingCount int64
+		testDB.Model(&LogStream{}).Count(&remainingCount)
+		tassert.Equal(t, int64(0), remainingCount, "Should have 0 log streams remaining")
+	})
+}
