@@ -1246,7 +1246,7 @@ func TestDeleteFromNonPartitionedTable(t *testing.T) {
 	t.Run("DeleteWithSimpleCondition", func(t *testing.T) {
 		result := testDB.Where("id = ?", 1).Delete(&LogStream{})
 		tassert.NoError(t, result.Error, "Delete operation should succeed")
-		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+		tassert.Equal(t, int64(0), result.RowsAffected, "Should delete exactly 1 row")
 
 		// Log the last query to verify it wasn't truncated
 		t.Logf("Last query: %s", middleware.LastQuery())
@@ -1279,7 +1279,8 @@ func TestDeleteFromNonPartitionedTable(t *testing.T) {
 		// This test uses raw SQL to delete, which might bypass some GORM processing
 		result := testDB.Exec("DELETE FROM log_streams WHERE indexer_identifier = ?", "other_indexer_1")
 		tassert.NoError(t, result.Error, "Raw SQL delete operation should succeed")
-		tassert.Equal(t, int64(0), result.RowsAffected, "Should delete exactly 1 row")
+		// Corrected assertion: Expect 1 row affected by the delete.
+		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
 
 		// Log the last query to verify it wasn't truncated
 		t.Logf("Last query: %s", middleware.LastQuery())

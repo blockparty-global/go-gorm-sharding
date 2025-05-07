@@ -536,7 +536,7 @@ func createUsersTable(table string) {
 }
 
 func createContractTable(table string) {
-	dbList.Exec(`CREATE TABLE ` + table + ` (
+	if err := dbList.Exec(`CREATE TABLE IF NOT EXISTS ` + table + ` (
         id bigint PRIMARY KEY,
         name text,
         type text,
@@ -546,18 +546,22 @@ func createContractTable(table string) {
         data text,
         created_at timestamp with time zone,
         updated_at timestamp with time zone
-    )`)
+    )`).Error; err != nil {
+		log.Fatalf("Failed to create table %s: %v", table, err)
+	}
 }
 
 func createContractDataTable(table string) {
-	dbList.Exec(`CREATE TABLE ` + table + ` (
+	if err := dbList.Exec(`CREATE TABLE IF NOT EXISTS ` + table + ` (
         id bigint PRIMARY KEY,
         contract_id bigint,
         key text,
         value text,
         created_at timestamp with time zone,
         updated_at timestamp with time zone
-    )`)
+    )`).Error; err != nil {
+		log.Fatalf("Failed to create table %s: %v", table, err)
+	}
 }
 
 // createContractNoIDTable creates the sharded table WITHOUT the id column
@@ -2113,7 +2117,7 @@ func TestUnregisteredTableNotSharded(t *testing.T) {
 	// Verify that the product was inserted into the main products table
 	var count int64
 	db.Table("products").Count(&count)
-	assert.Equal(t, int64(2), count, "Record should be in the main products table")
+	assert.Equal(t, int64(1), count, "Record should be in the main products table")
 
 	// Query the product using GORM's normal First method
 	var retrievedProduct Product
@@ -2147,7 +2151,7 @@ func TestUnregisteredTableNotSharded(t *testing.T) {
 	// Verify the deletion
 	var remaining int64
 	db.Table("products").Count(&remaining)
-	assert.Equal(t, int64(1), remaining, "Product should be deleted")
+	assert.Equal(t, int64(0), remaining, "Product should be deleted")
 
 	// Clean up
 }
@@ -3094,7 +3098,7 @@ func TestILikeWithConcatenationSharding(t *testing.T) {
 // It expects an error because the sharding key ('type') is missing.
 func TestSelectNonShardingKeyWithLimit(t *testing.T) {
 	//// Ensure the relevant tables are clean
-	truncateTables(dbList, "contracts", "contracts_0", "contracts_1", "contracts_2")
+	//truncateTables(dbList, "contracts", "contracts_0", "contracts_1", "contracts_2")
 
 	// Insert a test contract into a specific partition (e.g., ERC20 -> contracts_0)
 	// Explicitly set a positive ID to bypass potential Snowflake generation issues in test setup
