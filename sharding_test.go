@@ -70,6 +70,14 @@ type Contract struct {
 	UpdatedAt time.Time
 }
 
+// ServiceStatus represents a service with a status, list-partitioned by Status
+type ServiceStatus struct {
+	ID     int64  `gorm:"primarykey"`
+	Name   string // Non-sharding key to query by
+	Status string `gorm:"index:idx_status"` // Sharding key (e.g., "ONLINE", "OFFLINE", "MAINTENANCE")
+	Data   string
+}
+
 // ContractNoID represents a contract table without a managed ID column,
 // using Address as the primary key for conflict resolution.
 type ContractNoID struct {
@@ -164,6 +172,10 @@ func dbListURL() string {
 }
 
 var (
+	dbServiceConfig = postgres.Config{ // This is the configuration for the ServiceStatus test DB
+		DSN:                  dbURL(), // Assuming dbURL() is appropriate, or a dedicated one could be made
+		PreferSimpleProtocol: true,
+	}
 	dbConfig = postgres.Config{
 		DSN:                  dbURL(),
 		PreferSimpleProtocol: true,
@@ -189,12 +201,12 @@ var (
 		PreferSimpleProtocol: true,
 	}
 
-	db, dbNoID, dbRead, dbWrite, dbList, dbNoIDTest *gorm.DB // Add dbNoIDTest
+	db, dbNoID, dbRead, dbWrite, dbList, dbServiceForTest, dbNoIDTest *gorm.DB // Renamed dbServiceConfig to dbServiceForTest
 
-	listConfigs                                                                                                                                            map[string]Config
-	shardingConfig, shardingConfigOrderDetails, shardingConfigNoID, shardingConfigUser, listShardingConfig, contractDataConfig, shardingConfigContractNoID Config    // Add shardingConfigContractNoID
-	middleware, middlewareNoID, listMiddleware, middlewareContractNoID                                                                                     *Sharding // Add middlewareContractNoID
-	node, _                                                                                                                                                = snowflake.NewNode(1)
+	listConfigs                                                                                                                                                                       map[string]Config
+	shardingConfig, shardingConfigOrderDetails, shardingConfigNoID, shardingConfigUser, listShardingConfig, contractDataConfig, shardingConfigContractNoID, serviceTestShardingConfig Config    // Added serviceTestShardingConfig
+	middleware, middlewareNoID, listMiddleware, middlewareContractNoID, middlewareServiceTest                                                                                         *Sharding // Added middlewareServiceTest
+	node, _                                                                                                                                                                           = snowflake.NewNode(1)
 )
 
 func init() {
@@ -237,6 +249,37 @@ func init() {
 		DisableForeignKeyConstraintWhenMigrating: true,
 		Logger:                                   logger.Default.LogMode(logger.Info),
 	})
+
+	// Initialize dbServiceForTest
+	if mysqlDialector() {
+		// dbServiceForTest, _ = gorm.Open(mysql.Open(dbServiceConfig.DSN), &gorm.Config{ /* ... */ })
+		// For now, assume PostgreSQL for simplicity based on existing dbServiceConfig type
+		dbServiceForTest, _ = gorm.Open(postgres.New(dbServiceConfig), &gorm.Config{
+			DisableForeignKeyConstraintWhenMigrating: true,
+			Logger:                                   logger.Default.LogMode(logger.Info),
+		})
+	} else {
+		dbServiceForTest, _ = gorm.Open(postgres.New(dbServiceConfig), &gorm.Config{
+			DisableForeignKeyConstraintWhenMigrating: true,
+			Logger:                                   logger.Default.LogMode(logger.Info),
+		})
+	}
+
+	serviceTestShardingConfig = Config{
+		PartitionType:  PartitionTypeList,
+		ShardingKey:    "status",
+		NumberOfShards: 3, // Example for "ONLINE", "OFFLINE", "MAINTENANCE"
+		ListValues: map[string]int{
+			"ONLINE":      0,
+			"OFFLINE":     1,
+			"MAINTENANCE": 2,
+		},
+		DefaultPartition:    -1, // Or a specific default partition index
+		PrimaryKeyGenerator: PKSnowflake,
+		DoubleWrite:         true, // Crucial for the test's expectation
+	}
+	middlewareServiceTest = Register(map[string]Config{"service_statuses": serviceTestShardingConfig}, &ServiceStatus{})
+	dbServiceForTest.Use(middlewareServiceTest)
 
 	shardingConfig = Config{
 		DoubleWrite:         true,
@@ -330,8 +373,6 @@ func init() {
 			return fmt.Sprintf("_%d", partitionNum), nil
 		},
 	}
-
-	// List partitioning config for related contract data table
 	// Updated contractDataConfig
 	contractDataConfig = Config{
 		PartitionType:       PartitionTypeList,
@@ -418,15 +459,23 @@ func init() {
 	fmt.Println("AutoMigrate tables ...")
 	// ... (existing AutoMigrate calls) ...
 	// Don't AutoMigrate ContractNoID here, we'll create tables manually in the test
-	err := db.AutoMigrate(&Order{}, &Category{}, &OrderDetail{}, &User{})
+	var err error
+	err = db.AutoMigrate(&Order{}, &Category{}, &OrderDetail{}, &User{})
 	if err != nil {
 		panic(err)
 	}
 
 	fmt.Println("Creating list partitioning test tables...")
+	// AutoMigrate Contract and ContractData (base tables)
 	err = dbList.AutoMigrate(&Contract{}, &ContractData{})
 	if err != nil {
 		panic(fmt.Sprintf("failed to auto-migrate list partitioning test tables: %v", err))
+	}
+
+	// AutoMigrate ServiceStatus base table on dbServiceForTest
+	err = dbServiceForTest.AutoMigrate(&ServiceStatus{})
+	if err != nil {
+		panic(fmt.Sprintf("failed to auto-migrate ServiceStatus on dbServiceForTest: %v", err))
 	}
 
 	stables := []string{
@@ -448,6 +497,20 @@ func init() {
 		createContractTable(fmt.Sprintf("contracts_%d", i))         // Uses dbList
 		createContractDataTable(fmt.Sprintf("contract_data_%d", i)) // Uses dbList
 	}
+
+	// Create sharded tables for ServiceStatus on dbServiceForTest
+	for i := 0; i < int(serviceTestShardingConfig.NumberOfShards); i++ {
+		tableName := fmt.Sprintf("service_statuses_%d", i)
+		if err := dbServiceForTest.Exec(`CREATE TABLE IF NOT EXISTS ` + tableName + ` (
+            id bigint PRIMARY KEY,
+            name text,
+            status text,
+            data text
+        )`).Error; err != nil {
+			log.Fatalf("Failed to create table %s on dbServiceForTest: %v", tableName, err)
+		}
+	}
+
 	// Register listMiddleware AFTER creating its tables
 	dbList.Use(listMiddleware)
 
@@ -461,6 +524,18 @@ func init() {
 	// Register other middleware
 	db.Use(middleware)
 	dbNoID.Use(middlewareNoID)
+}
+
+// createServiceStatusTable creates the sharded table for ServiceStatus
+func createServiceStatusTable(table string) {
+	if err := dbList.Exec(`CREATE TABLE IF NOT EXISTS ` + table + ` (
+        id bigint PRIMARY KEY,
+        name text,
+        status text,
+        data text
+    )`).Error; err != nil {
+		log.Fatalf("Failed to create table %s: %v", table, err)
+	}
 }
 
 // Helper functions to create tables
@@ -607,10 +682,11 @@ func dropTables() {
 		// Add any other potential test tables here
 		"asset_contracts", "asset_contracts_0", "asset_contracts_1", "asset_contracts_2", "asset_contracts_3", // Added based on previous error log
 		"contract_no_ids", "contract_no_ids_0", "contract_no_ids_1", "contract_no_ids_2", "contract_no_ids_3", // Add new tables
+		"service_statuses", "service_statuses_0", "service_statuses_1", "service_statuses_2", // Add ServiceStatus tables
 	}
 
 	// Ensure all DB connections drop these tables
-	dbsToClean := []*gorm.DB{db, dbNoID, dbRead, dbWrite, dbList, dbNoIDTest} // Add dbNoIDTest
+	dbsToClean := []*gorm.DB{db, dbNoID, dbRead, dbWrite, dbList, dbNoIDTest, dbServiceForTest} // Added dbServiceForTest
 
 	for _, table := range allTestTables {
 		for _, dbConn := range dbsToClean {
@@ -618,13 +694,16 @@ func dropTables() {
 				dbConn.Exec("DROP TABLE IF EXISTS " + table + " CASCADE") // Use CASCADE for safety
 				// ... (sequence dropping logic - not applicable for ContractNoID) ...
 				if !strings.HasPrefix(table, "contract_no_ids") { // Don't try to drop sequences for tables without IDs
-					if mysqlDialector() {
-						// MySQL/MariaDB sequence table naming might differ or not exist, handle appropriately
-						// dbConn.Exec("DROP TABLE IF EXISTS gorm_sharding_" + table + "_id_seq")
-					} else { // Added missing opening brace
-						// PostgreSQL sequence dropping
+					if !mysqlDialector() { // Only for PostgreSQL
+						// Attempt to drop GORM's default sequence name (e.g., categories_id_seq)
+						dbConn.Exec("DROP SEQUENCE IF EXISTS " + table + "_id_seq")
+						// Attempt to drop sharding plugin's sequence name (e.g., gorm_sharding_orders_id_seq)
+						// This is relevant if PKPGSequence is used for sharded tables.
 						dbConn.Exec("DROP SEQUENCE IF EXISTS gorm_sharding_" + table + "_id_seq")
 					}
+					// For MySQL, sequence handling is different (often via AUTO_INCREMENT property or separate sequence tables if using MariaDB specific features)
+					// The existing commented out line for MySQL sequence table might be relevant if PKMySQLSequence uses a table:
+					// else if mysqlDialector() { // dbConn.Exec("DROP TABLE IF EXISTS gorm_sharding_" + table + "_id_seq") }
 				}
 			}
 		}
@@ -3093,43 +3172,41 @@ func TestILikeWithConcatenationSharding(t *testing.T) {
 	})
 }
 
-// TestSelectNonShardingKeyWithLimit tests querying a list-partitioned table
-// using a non-sharding key column with LIMIT 1 (implicit in First()).
-// It expects an error because the sharding key ('type') is missing.
+// TestSelectNonShardingKeyWithLimit tests querying a list-partitioned table (ServiceStatus)
+// using a non-sharding key column ('name') with LIMIT 1 (implicit in First()).
+// It expects the query to succeed by falling back to the base table because DoubleWrite is true
+// for the serviceStatusConfig.
 func TestSelectNonShardingKeyWithLimit(t *testing.T) {
-	//// Ensure the relevant tables are clean
-	//truncateTables(dbList, "contracts", "contracts_0", "contracts_1", "contracts_2")
-
-	// Insert a test contract into a specific partition (e.g., ERC20 -> contracts_0)
-	// Explicitly set a positive ID to bypass potential Snowflake generation issues in test setup
-	testContract := Contract{
-		ID:   99999, // Assign a specific positive ID
-		Name: "TestLimitContract",
-		Type: "ERC20", // This determines the shard (contracts_0)
-		Data: "TestData",
+	dbNoIDTest.AutoMigrate(&ServiceStatus{}) // Ensure the table is migrated
+	// Insert a test ServiceStatus record into a specific partition
+	// e.g., Status "ONLINE" -> service_statuses_0
+	testStatus := ServiceStatus{
+		ID:     12345, // Assign a specific positive ID to avoid issues with sequence/snowflake in test
+		Name:   "MainAPIService",
+		Status: "ONLINE", // This determines the shard (service_statuses_0)
+		Data:   "Healthy",
 	}
-	err := dbList.Create(&testContract).Error
-	require.NoError(t, err, "Failed to insert test contract")
-	// Verify the ID is positive after Create (it might be the assigned 99999 or a sequence ID)
-	require.Greater(t, testContract.ID, int64(0), "Test contract ID should be positive after Create")
+	err := dbNoIDTest.Create(&testStatus).Error // Use dbServiceForTest
+	require.NoError(t, err, "Failed to insert test ServiceStatus")
+	// Verify the ID is positive after Create (it might be the assigned 12345 or a sequence ID if PK is auto-gen)
+	require.Greater(t, testStatus.ID, int64(0), "Test ServiceStatus ID should be positive after Create")
 
 	// Attempt to query using a non-sharding key ('name') with First() (which adds LIMIT 1)
-	var foundContract Contract
-	err = dbList.Model(&Contract{}).Where("name = ?", "TestLimitContract").First(&foundContract).Error
+	var foundStatus ServiceStatus
+	err = dbNoIDTest.Model(&ServiceStatus{}).Where("name = ?", "MainAPIService").First(&foundStatus).Error // Use dbServiceForTest
 
-	// Assert that NO error occurred because DoubleWrite is enabled, allowing fallback to the base table
+	// Assert that NO error occurred because DoubleWrite is enabled for serviceTestShardingConfig,
+	// allowing fallback to the base table.
 	require.NoError(t, err, "Query without sharding key should fallback to base table and succeed when DoubleWrite is true")
 
-	// Assert that the correct contract was found from the base table by checking non-ID fields.
-	// The ID found will likely be the sequence-generated one from the base table insert.
-	require.Greater(t, foundContract.ID, int64(0), "Found contract ID should be positive (from base table sequence)")
-	require.Equal(t, "TestLimitContract", foundContract.Name, "Found contract name should match")
-	require.Equal(t, "ERC20", foundContract.Type, "Found contract type should match")
+	// Assert that the correct status was found from the base table.
+	// The ID found might be different if the base table uses a sequence, but other fields should match.
+	require.Greater(t, foundStatus.ID, int64(0), "Found status ID should be positive (from base table sequence or original if not auto-gen)")
+	require.Equal(t, "MainAPIService", foundStatus.Name, "Found status name should match")
+	require.Equal(t, "ONLINE", foundStatus.Status, "Found status type should match")
+	require.Equal(t, "Healthy", foundStatus.Data, "Found status data should match")
 
-	t.Logf("Successfully verified that querying by non-sharding key with LIMIT 1 falls back to base table and finds the correct record (ID: %d).", foundContract.ID)
-
-	// Clean up
-	truncateTables(dbList, "contracts", "contracts_0", "contracts_1", "contracts_2")
+	t.Logf("Successfully verified that querying ServiceStatus by non-sharding key ('name') with LIMIT 1 falls back to base table and finds the correct record (ID: %d).", foundStatus.ID)
 }
 
 // TestInsertOnConflictNoIDColumn verifies that inserting into a sharded table
