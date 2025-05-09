@@ -1,6 +1,7 @@
 package sharding
 
 import (
+	"gorm.io/gorm/logger"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -33,6 +34,7 @@ func TestBalanceQueryWithSharding(t *testing.T) {
 	}
 	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
 		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
 	})
 	assert.NoError(t, err, "Failed to connect to database")
 
@@ -141,6 +143,7 @@ func TestSpecificContractQueryWithSharding(t *testing.T) {
 	}
 	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
 		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
 	})
 	assert.NoError(t, err, "Failed to connect to database")
 
@@ -254,6 +257,7 @@ func TestMultipleContractsSharding(t *testing.T) {
 	}
 	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
 		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
 	})
 	assert.NoError(t, err, "Failed to connect to database")
 

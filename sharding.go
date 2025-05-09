@@ -2047,6 +2047,12 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 		if subselect, ok := n.SubLink.Subselect.Node.(*pg_query.Node_SelectStmt); ok {
 			replaceSelectStmtTableName(subselect.SelectStmt, tableMap)
 		}
+	case *pg_query.Node_NullTest:
+		// Handle IS NULL and IS NOT NULL conditions
+		if n.NullTest.Arg != nil {
+			replaceTableNames(n.NullTest.Arg, tableMap)
+		}
+
 	default:
 		// Recursively process child nodes if any
 		reflectValue := reflect.ValueOf(n)
