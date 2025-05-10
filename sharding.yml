@@ -1,0 +1,13 @@
+# Sharding configuration
+logging:
+  level: 0
+  show_time: false
+  format: text
+  output: stdout 
+
+connection:
+  max_lifetime: 3
+  transaction_timeout: 3
+  health_check_interval: 60
+  max_retries: 3
+  enable_auto_cleanup: true 
