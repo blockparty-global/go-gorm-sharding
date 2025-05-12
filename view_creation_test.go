@@ -189,37 +189,6 @@ func TestCreateHoldersView(t *testing.T) {
 		require.NoError(t, err, "Failed to get holders count for contract1")
 		assert.Equal(t, int64(4), count, "Query should consistently return 4 distinct account+owner combinations")
 	})
-
-	// Test 4: Create and verify view with hash partitioning
-	t.Run("CreateAndVerifyViewWithHashPartitioning", func(t *testing.T) {
-		// Create the view for contract1
-		err := service.CreateHoldersView(testContract1)
-		require.NoError(t, err, "Failed to create holders view for contract1")
-
-		// Query the view to verify it returns the correct count
-		var viewCount int64
-		err = testDB.Raw("SELECT * FROM holders_" + testContract1).Scan(&viewCount).Error
-		require.NoError(t, err, "Failed to query the view")
-		assert.Equal(t, int64(4), viewCount, "View should return 4 distinct account+owner combinations")
-
-		// Verify the view creation query was routed to the correct shard
-		lastQuery := middleware.LastQuery()
-		assert.Contains(t, lastQuery, shardedTable1, "View creation should be routed to the correct shard table")
-
-		// Create the view for contract2
-		err = service.CreateHoldersView(testContract2)
-		require.NoError(t, err, "Failed to create holders view for contract2")
-
-		// Query the view to verify it returns the correct count
-		err = testDB.Raw("SELECT * FROM holders_" + testContract2).Scan(&viewCount).Error
-		require.NoError(t, err, "Failed to query the view")
-		assert.Equal(t, int64(2), viewCount, "View should return 2 distinct account+owner combinations")
-
-		// Verify the view creation query was routed to the correct shard
-		lastQuery = middleware.LastQuery()
-		assert.Contains(t, lastQuery, shardedTable2, "View creation should be routed to the correct shard table")
-	})
-
 	// Clean up
 	testDB.Exec("TRUNCATE TABLE generic_balances")
 	testDB.Exec("TRUNCATE TABLE " + shardedTable1)

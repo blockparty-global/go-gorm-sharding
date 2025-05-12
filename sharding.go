@@ -921,6 +921,63 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 		*pg_query.Node_GrantStmt:
 		// DDL statements. Bypass sharding.
 		return query, query, tableName, nil
+	case *pg_query.Node_ViewStmt:
+		// Handle CREATE OR REPLACE VIEW statements
+		viewStmt := stmtNode.ViewStmt
+
+		// Extract the query part of the view definition
+		if viewStmt.Query != nil {
+			// Check if the query references any sharded tables
+			if selectStmt, ok := viewStmt.Query.Node.(*pg_query.Node_SelectStmt); ok {
+				// Collect tables from the SELECT statement
+				tables := collectTablesFromSelect(selectStmt.SelectStmt)
+
+				// Check if any of these tables are sharded
+				for _, table := range tables {
+					s.mutex.RLock()
+					cfg, ok := s.configs[table]
+					s.mutex.RUnlock()
+
+					if ok {
+						// This is a sharded table, extract sharding key from conditions
+						if selectStmt.SelectStmt.WhereClause != nil {
+							conditions := []*pg_query.Node{selectStmt.SelectStmt.WhereClause}
+
+							// Extract sharding key value
+							shardingKey := cfg.ShardingKey
+							value, id, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, nil, table)
+
+							if keyFound || id != 0 {
+								// Determine the suffix
+								suffix, err := getSuffix(value, id, keyFound, cfg)
+								if err != nil {
+									return ftQuery, stQuery, tableName, err
+								}
+
+								// Replace the table name in the query with the sharded table name
+								shardedTable := table + suffix
+								tableMap := map[string]string{table: shardedTable}
+
+								// Replace table names in the query part
+								replaceTableNames(viewStmt.Query, tableMap)
+
+								// Deparse the modified AST back to SQL
+								stmts := []*pg_query.RawStmt{stmt}
+								stQuery, err = pg_query.Deparse(&pg_query.ParseResult{Stmts: stmts})
+								if err != nil {
+									return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing modified view query: %v", err)
+								}
+
+								return ftQuery, stQuery, tableName, nil
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// If no sharding key found or no sharded tables, return the original query
+		return query, query, tableName, nil
 	default:
 		return ftQuery, stQuery, tableName, fmt.Errorf("unsupported statement type")
 	}
