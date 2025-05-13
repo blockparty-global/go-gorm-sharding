@@ -734,6 +734,10 @@ func TestMigrate(t *testing.T) {
 	// 3. Verify the correct tables were created
 	tables, _ = db.Migrator().GetTables()
 	sort.Strings(tables)
+
+	// Log the actual tables
+	t.Logf("Actual tables after AutoMigrate: %v", tables)
+
 	assert.Equal(t, expectedTablesAfterMigrate, tables, "Tables after AutoMigrate should match expected")
 
 	// 4. Auto migrate again (should be idempotent)
