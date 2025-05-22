@@ -89,7 +89,7 @@ func DefaultConfig() *ShardingConfig {
 		},
 		Connection: ConnectionConfig{
 			MaxLifetime:         300,
-			TransactionTimeout:  300, // 5 minutes for balance`s batch insert operations
+			TransactionTimeout:  900, // 15 minutes for balance`s batch insert operations
 			HealthCheckInterval: 60,
 			MaxRetries:          3,
 			EnableAutoCleanup:   true,
