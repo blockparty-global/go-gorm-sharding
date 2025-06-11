@@ -1388,16 +1388,25 @@ func (s *Sharding) extractShardingKeyFromConditions(shardingKey string, conditio
 
 	// If sharding key is not found, attempt to find 'id' for primary key sharding
 	if !keyFound {
-		var idFound bool
-		var idValue interface{}
-
 		// For hash partitioning, we can use the ID, but for list partitioning,
 		// we must have the list key to determine the correct partition
 		if config.PartitionType == PartitionTypeList {
-
 			// todo  use global index instead
 			return nil, 0, false, ErrMissingShardingKey
 		}
+
+		// Check if DoubleWrite is enabled - if so, don't use ID for sharding
+		// when the sharding key is non-ID, instead fall back to double write table
+		if config.DoubleWrite && config.ShardingKey != "id" {
+			// With DoubleWrite enabled and non-ID sharding key,
+			// we should not use ID to determine shard, fall back to base table
+			GetLogger().Debug("DoubleWrite enabled with non-ID sharding key (%s), not using ID for shard determination", config.ShardingKey)
+			return nil, 0, false, ErrMissingShardingKey
+		}
+
+		// Look for 'id' field
+		var idFound bool
+		var idValue interface{}
 
 		for _, condition := range conditions {
 			//GetLogger().Trace("Traversing condition for 'id'")
@@ -1412,9 +1421,54 @@ func (s *Sharding) extractShardingKeyFromConditions(shardingKey string, conditio
 				return nil, 0, false, ErrInvalidID
 			}
 			id = idInt64
+			// Return the ID for sharding
 			return nil, id, true, nil
 		} else {
-			// Neither sharding key nor 'id' found; return error
+			// Neither sharding key nor 'id' found
+			err = ErrMissingShardingKey
+			return nil, 0, false, err
+		}
+	}
+	// If sharding key is not found, attempt to find 'id' for primary key sharding
+	if !keyFound {
+		// For hash partitioning, we can use the ID, but for list partitioning,
+		// we must have the list key to determine the correct partition
+		if config.PartitionType == PartitionTypeList {
+			// todo  use global index instead
+			return nil, 0, false, ErrMissingShardingKey
+		}
+
+		// Look for 'id' field first
+		var idFound bool
+		var idValue interface{}
+
+		for _, condition := range conditions {
+			//GetLogger().Trace("Traversing condition for 'id'")
+			idFound, idValue, err = traverseConditionForKey("id", condition, args, knownKeys, aliasMap)
+			if idFound || err != nil {
+				break
+			}
+		}
+
+		// Check if DoubleWrite is enabled - if so, don't use ID for sharding
+		// when the sharding key is non-ID, instead fall back to double write table
+		if config.DoubleWrite && config.ShardingKey != "id" && idFound {
+			// With DoubleWrite enabled and non-ID sharding key,
+			// we should not use ID to determine shard, fall back to base table
+			GetLogger().Debug("DoubleWrite enabled with non-ID sharding key (%s), not using ID for shard determination", config.ShardingKey)
+			return nil, 0, false, ErrMissingShardingKey
+		}
+
+		if idFound {
+			idInt64, err := toInt64(idValue)
+			if err != nil {
+				return nil, 0, false, ErrInvalidID
+			}
+			id = idInt64
+			// Return the ID for sharding
+			return nil, id, true, nil
+		} else {
+			// Neither sharding key nor 'id' found
 			err = ErrMissingShardingKey
 			return nil, 0, false, err
 		}
@@ -2148,7 +2202,7 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 			// Check if the first field is a table name
 			if stringNode, ok := fields[0].Node.(*pg_query.Node_String_); ok {
 				originalTableName := stringNode.String_.Sval
-				if newTableName, exists := tableMap[originalTableName]; exists {
+				if newTableName, exists := caseInsensitiveTableLookup(tableMap, originalTableName); exists {
 					// Replace the table name with the sharded name
 					//GetLogger().Debug("Replacing table name '%s' with sharded name '%s' in ColumnRef", originalTableName, newTableName)
 					stringNode.String_.Sval = newTableName
