@@ -126,6 +126,13 @@ type Config struct {
 	// ValueConverter converts values before they are used in SQL queries
 	// This is especially useful for handling custom types like UInt256
 	ValueConverter func(value interface{}) (interface{}, error)
+	
+	// ShardPercentageThreshold specifies the threshold (0.0-1.0) for using sharded queries vs base table.
+	// When the percentage of shards that would be queried exceeds this threshold, 
+	// the query will use the base table instead of creating a UNION across many shards.
+	// Default is 0.7 (70%) - if more than 70% of shards would be queried, use base table.
+	// Set to 1.0 to always use sharding, or 0.0 to always use base table (when DoubleWrite is enabled).
+	ShardPercentageThreshold float64
 
 	// ListValues maps category values to partition numbers (for list partitioning)
 	// For example: {"ERC20": 0, "ERC721": 1, "ERC1155": 2}
@@ -193,6 +200,11 @@ func (s *Sharding) compile() error {
 		// Set the default partition type if not specified
 		if c.PartitionType == "" {
 			c.PartitionType = PartitionTypeHash
+		}
+		
+		// Set default ShardPercentageThreshold if not specified
+		if c.ShardPercentageThreshold == 0 {
+			c.ShardPercentageThreshold = 0.7 // Default to 70%
 		}
 
 		// Validate NumberOfShards for Snowflake
@@ -759,6 +771,11 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 		// If this is a SELECT without sharding key conditions
 		if isSelect && len(conditions) > 0 {
 			hasShardingKey := false
+			hasCompositeINWithMultipleValues := false
+			var compositeINValues []interface{}
+			var compositeINTable string
+			var compositeINConfig Config
+			
 			for _, table := range tables {
 				s.mutex.RLock()
 				cfg, ok := s.configs[table]
@@ -766,6 +783,28 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 				if ok {
 					shardingKey := cfg.ShardingKey
+					
+					// First check for composite IN clauses with multiple values
+					for _, condition := range conditions {
+						keyFound, values, _ := extractAllShardingKeysFromCompositeIn(shardingKey, condition, args, nil)
+						if keyFound && len(values) > 1 {
+							// We have a composite IN clause with multiple sharding key values
+							hasCompositeINWithMultipleValues = true
+							compositeINValues = values
+							compositeINTable = table
+							compositeINConfig = cfg
+							GetLogger().Debug("Found composite IN clause with %d values for sharding key %s in table %s", 
+								len(values), shardingKey, table)
+							break
+						}
+					}
+					
+					// If we found multiple values, break out of table loop
+					if hasCompositeINWithMultipleValues {
+						break
+					}
+					
+					// Otherwise check for single sharding key
 					_, _, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, nil, table)
 					if keyFound {
 						hasShardingKey = true
@@ -773,6 +812,83 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 					}
 				} else {
 					return query, query, tableName, nil
+				}
+			}
+
+			// Handle composite IN clause with multiple sharding key values
+			if hasCompositeINWithMultipleValues {
+				// Determine all unique suffixes needed
+				uniqueSuffixes := make(map[string]bool)
+				for _, value := range compositeINValues {
+					suffix, err := getSuffix(value, 0, true, compositeINConfig)
+					if err != nil {
+						GetLogger().Error("Error determining suffix for value %v: %v", value, err)
+						continue
+					}
+					uniqueSuffixes[suffix] = true
+				}
+				
+				GetLogger().Debug("Composite IN clause requires %d unique shards: %v", len(uniqueSuffixes), uniqueSuffixes)
+				
+				// If only one suffix is needed, proceed normally
+				if len(uniqueSuffixes) == 1 {
+					hasShardingKey = true
+				} else if len(uniqueSuffixes) > 1 {
+					// Calculate the percentage of shards that would be queried
+					totalShards := float64(compositeINConfig.NumberOfShards)
+					queriedShards := float64(len(uniqueSuffixes))
+					shardPercentage := queriedShards / totalShards
+					
+					GetLogger().Debug("Query would use %.1f%% of shards (%d/%d), threshold is %.1f%%", 
+						shardPercentage*100, len(uniqueSuffixes), compositeINConfig.NumberOfShards, 
+						compositeINConfig.ShardPercentageThreshold*100)
+					
+					// Check if we should use base table instead based on threshold
+					if shardPercentage > compositeINConfig.ShardPercentageThreshold && compositeINConfig.DoubleWrite {
+						// Use base table when percentage exceeds threshold
+						GetLogger().Debug("Shard percentage %.1f%% exceeds threshold %.1f%%, using base table", 
+							shardPercentage*100, compositeINConfig.ShardPercentageThreshold*100)
+						
+						// Return original query to use base table
+						return query, query, compositeINTable, nil
+					}
+					
+					// Otherwise, create UNION query for multiple shards
+					unionQueries := []string{}
+					
+					for suffix := range uniqueSuffixes {
+						// Create table map for this suffix
+						suffixTableMap := make(map[string]string)
+						suffixTableMap[compositeINTable] = compositeINTable + suffix
+						
+						// Parse the original query
+						parsedCopy, parseErr := pg_query.Parse(query)
+						if parseErr != nil {
+							return ftQuery, stQuery, tableName, fmt.Errorf("error parsing query for UNION conversion: %v", parseErr)
+						}
+						
+						if len(parsedCopy.Stmts) == 0 {
+							return ftQuery, stQuery, tableName, fmt.Errorf("no statements found in parsed query")
+						}
+						
+						// Replace table names in the parsed query
+						replaceTableNames(parsedCopy.Stmts[0].Stmt, suffixTableMap)
+						
+						// Deparse back to SQL
+						deparsedSQL, deparseErr := pg_query.Deparse(&pg_query.ParseResult{Stmts: parsedCopy.Stmts})
+						if deparseErr != nil {
+							return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing query for suffix %s: %v", suffix, deparseErr)
+						}
+						
+						unionQueries = append(unionQueries, "("+deparsedSQL+")")
+					}
+					
+					// Combine with UNION ALL
+					stQuery = strings.Join(unionQueries, " UNION ALL ")
+					ftQuery = query // Keep original for double write
+					
+					GetLogger().Debug("Created UNION query for composite IN across %d shards: %s", len(uniqueSuffixes), stQuery)
+					return ftQuery, stQuery, compositeINTable, nil
 				}
 			}
 
@@ -1677,6 +1793,87 @@ func extractShardingKeyFromCompositeIn(shardingKey string, node *pg_query.Node, 
 								return false, nil, fmt.Errorf("subquery in composite IN not supported")
 							}
 						}
+					}
+				}
+			}
+		}
+	}
+
+	return false, nil, nil
+}
+
+// extractAllShardingKeysFromCompositeIn extracts ALL values for the sharding key from a composite IN clause
+func extractAllShardingKeysFromCompositeIn(shardingKey string, node *pg_query.Node, args []interface{}, knownKeys map[string]interface{}) (keyFound bool, values []interface{}, err error) {
+	if node == nil {
+		return false, nil, nil
+	}
+
+	values = []interface{}{}
+
+	switch n := node.Node.(type) {
+	case *pg_query.Node_AExpr:
+		if n.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_IN {
+			// This is an IN expression
+			GetLogger().Debug("Found IN expression for extracting all sharding keys")
+
+			// Check the left side (columns) of the IN expression
+			if row, ok := n.AExpr.Lexpr.Node.(*pg_query.Node_RowExpr); ok {
+				GetLogger().Debug("Found row expression with %d args", len(row.RowExpr.Args))
+
+				// Find the column index for our sharding key
+				shardingKeyIndex := -1
+				for colIndex, colNode := range row.RowExpr.Args {
+					if colRef, ok := colNode.Node.(*pg_query.Node_ColumnRef); ok {
+						colName := extractColumnName(colRef.ColumnRef, nil)
+						GetLogger().Debug("Column at position %d: %s", colIndex, colName)
+
+						if getColumnNameWithoutTable(colName) == shardingKey {
+							shardingKeyIndex = colIndex
+							GetLogger().Debug("Found sharding key %s in composite IN at position %d", shardingKey, colIndex)
+							break
+						}
+					}
+				}
+
+				if shardingKeyIndex >= 0 {
+					// Extract ALL values from the right side at the sharding key position
+					switch rexpr := n.AExpr.Rexpr.Node.(type) {
+					case *pg_query.Node_List:
+						// List of RowExprs or other values
+						GetLogger().Debug("Right side is a list with %d items", len(rexpr.List.Items))
+						for _, item := range rexpr.List.Items {
+							if rowExpr, ok := item.Node.(*pg_query.Node_RowExpr); ok {
+								// Extract the value at the sharding key position
+								if shardingKeyIndex < len(rowExpr.RowExpr.Args) {
+									valueNode := rowExpr.RowExpr.Args[shardingKeyIndex]
+									value, err := extractValueFromExpr(valueNode, args)
+									if err != nil {
+										return false, nil, err
+									}
+									values = append(values, value)
+									GetLogger().Debug("Extracted value %v from tuple", value)
+								}
+							}
+						}
+						if len(values) > 0 {
+							return true, values, nil
+						}
+					case *pg_query.Node_RowExpr:
+						// Single RowExpr
+						GetLogger().Debug("Right side is a single row expression with %d items", len(rexpr.RowExpr.Args))
+						if shardingKeyIndex < len(rexpr.RowExpr.Args) {
+							valueNode := rexpr.RowExpr.Args[shardingKeyIndex]
+							value, err := extractValueFromExpr(valueNode, args)
+							if err != nil {
+								return false, nil, err
+							}
+							values = append(values, value)
+							return true, values, nil
+						}
+					case *pg_query.Node_SubLink:
+						// Subquery - currently not supported
+						GetLogger().Debug("Right side is a subquery (not supported)")
+						return false, nil, fmt.Errorf("subquery in composite IN not supported")
 					}
 				}
 			}
