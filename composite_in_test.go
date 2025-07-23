@@ -21,12 +21,12 @@ func generateUniqueTableName(prefix string) string {
 }
 
 // cleanupShardedTables drops the base table and all sharded tables
-func cleanupShardedTables(db *gorm.DB, tableName string, numShards int) {
+func cleanupShardedTables(db *gorm.DB, tableName string, numShards uint) {
 	// Drop base table
 	db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName))
 	
 	// Drop sharded tables
-	for i := 0; i < numShards; i++ {
+	for i := uint(0); i < numShards; i++ {
 		db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s_%02d", tableName, i))
 	}
 }
@@ -34,7 +34,7 @@ func cleanupShardedTables(db *gorm.DB, tableName string, numShards int) {
 // testTableContext holds table information for parallel tests
 type testTableContext struct {
 	name   string
-	shards int
+	shards uint
 }
 
 func (t *testTableContext) cleanup(db *gorm.DB) {
@@ -46,7 +46,7 @@ func (t *testTableContext) formatQuery(query string) string {
 }
 
 // runParallelTest helps run a test with unique table names for parallel execution
-func runParallelTest(t *testing.T, db *gorm.DB, numShards int, testFunc func(t *testing.T, db *gorm.DB, tc *testTableContext)) {
+func runParallelTest(t *testing.T, db *gorm.DB, numShards uint, testFunc func(t *testing.T, db *gorm.DB, tc *testTableContext)) {
 	t.Parallel()
 	
 	tc := &testTableContext{
@@ -201,25 +201,38 @@ type Token struct {
 }
 
 func TestShardPercentageThreshold(t *testing.T) {
-	// Note: This test cannot run in parallel because all subtests share the same table names
-	// To make it parallel-safe, each subtest would need to use unique table names
+	// Note: This test cannot run in parallel due to the following constraints:
+	// 1. All subtests share the same table names ("tokens")
+	// 2. GORM middlewares are applied globally to the DB instance
+	// 3. The sharding middleware affects all queries on the DB connection
+	// 
+	// To make these tests parallel-safe would require:
+	// - Unique table names for each test (which we've partially implemented)
+	// - Separate DB connections for each test to avoid middleware conflicts
+	// - Careful coordination of table creation/cleanup
+	//
+	// For now, these tests must run sequentially to avoid conflicts.
 	
 	// Enable debug logging for this test
 	oldLogLevel := DefaultLogLevel
 	SetLogLevel(LogLevelDebug)
 	defer SetLogLevel(oldLogLevel)
 
-	dbConfig := postgres.Config{
-		DSN:                  dbURL(),
-		PreferSimpleProtocol: true,
-	}
-	db, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
-		DisableForeignKeyConstraintWhenMigrating: true,
-		Logger:                                   logger.Default.LogMode(logger.Info),
-	})
-	assert.NoError(t, err)
-
 	t.Run("UseUNIONWhenBelowThreshold", func(t *testing.T) {
+		// Create a completely new DB connection for this test
+		dbConfig := postgres.Config{
+			DSN:                  dbURL(),
+			PreferSimpleProtocol: true,
+		}
+		db, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+			DisableForeignKeyConstraintWhenMigrating: true,
+			Logger:                                   logger.Default.LogMode(logger.Info),
+		})
+		assert.NoError(t, err)
+		
+		// Clean up any existing tables first
+		cleanupShardedTables(db, "tokens", 10)
+		
 		// Configure sharding with 10 shards and 50% threshold
 		middleware := Register(Config{
 			ShardingKey:              "contract",
@@ -231,7 +244,7 @@ func TestShardPercentageThreshold(t *testing.T) {
 
 		db.Use(middleware)
 
-		// Migrate the table
+		// Migrate the table - this will create both base and sharded tables
 		err = db.AutoMigrate(&Token{})
 		assert.NoError(t, err)
 
@@ -270,6 +283,20 @@ func TestShardPercentageThreshold(t *testing.T) {
 	})
 
 	t.Run("UseBaseTableWhenAboveThreshold", func(t *testing.T) {
+		// Create a completely new DB connection for this test
+		dbConfig := postgres.Config{
+			DSN:                  dbURL(),
+			PreferSimpleProtocol: true,
+		}
+		db, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+			DisableForeignKeyConstraintWhenMigrating: true,
+			Logger:                                   logger.Default.LogMode(logger.Info),
+		})
+		assert.NoError(t, err)
+		
+		// Clean up any existing tables first
+		cleanupShardedTables(db, "tokens", 10)
+		
 		// Configure sharding with 4 shards and 50% threshold
 		middleware := Register(Config{
 			ShardingKey:              "contract",
@@ -281,7 +308,7 @@ func TestShardPercentageThreshold(t *testing.T) {
 
 		db.Use(middleware)
 
-		// Migrate the table
+		// Migrate the table - this will create both base and sharded tables
 		err = db.AutoMigrate(&Token{})
 		assert.NoError(t, err)
 
@@ -345,6 +372,20 @@ func TestShardPercentageThreshold(t *testing.T) {
 	})
 
 	t.Run("CustomThreshold", func(t *testing.T) {
+		// Create a completely new DB connection for this test
+		dbConfig := postgres.Config{
+			DSN:                  dbURL(),
+			PreferSimpleProtocol: true,
+		}
+		db, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+			DisableForeignKeyConstraintWhenMigrating: true,
+			Logger:                                   logger.Default.LogMode(logger.Info),
+		})
+		assert.NoError(t, err)
+		
+		// Clean up any existing tables first
+		cleanupShardedTables(db, "tokens", 10)
+		
 		// Configure sharding with 10 shards and 30% threshold
 		middleware := Register(Config{
 			ShardingKey:              "contract",
@@ -356,7 +397,7 @@ func TestShardPercentageThreshold(t *testing.T) {
 
 		db.Use(middleware)
 
-		// Migrate the table
+		// Migrate the table - this will create both base and sharded tables
 		err = db.AutoMigrate(&Token{})
 		assert.NoError(t, err)
 
