@@ -1972,7 +1972,7 @@ func TestInsertWithPreGeneratedGID(t *testing.T) {
 	// Define the sharding configuration
 	numberOfShards := uint(4)
 	swapConfig := Config{
-		ShardingKey:         "id", // Changed from ShardingKey
+		ShardingKey:         "id",
 		NumberOfShards:      numberOfShards,
 		PrimaryKeyGenerator: PKCustom,
 		PrimaryKeyGeneratorFn: func(tableIdx int64) int64 {
@@ -3266,4 +3266,71 @@ func TestInsertOnConflictNoIDColumn(t *testing.T) {
 	assert.NoError(err, "Failed to find the inserted/updated record in the sharded table")
 	assert.Equal(contract.Address, foundContract.Address)
 	assert.Equal(contract.IsERC721, foundContract.IsERC721) // Check a field that should be updated
+}
+
+func TestSimpleIDShardingWithAutoIncrement(t *testing.T) {
+	type SimpleRecord struct {
+		ID      int64 `gorm:"primarykey;autoIncrement"`
+		Content string
+	}
+
+	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
+	})
+	require.NoError(t, err)
+
+	simpleConfig := Config{
+		ShardingKey:         "id",
+		NumberOfShards:      4,
+		PrimaryKeyGenerator: PKSnowflake,
+	}
+
+	testMiddleware := Register(map[string]Config{
+		"simple_records": simpleConfig,
+	}, &SimpleRecord{})
+
+	err = testDB.Use(testMiddleware)
+	require.NoError(t, err)
+
+	err = testDB.Exec("DROP TABLE IF EXISTS simple_records CASCADE").Error
+	require.NoError(t, err)
+	for i := 0; i < 4; i++ {
+		err = testDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS simple_records_%d CASCADE", i)).Error
+		require.NoError(t, err)
+	}
+
+	err = testDB.AutoMigrate(&SimpleRecord{})
+	require.NoError(t, err)
+
+	record := SimpleRecord{
+		Content: "Test content",
+	}
+	err = testDB.Create(&record).Error
+	require.NoError(t, err)
+	require.NotZero(t, record.ID, "ID should be auto-generated")
+
+	var retrieved SimpleRecord
+	err = testDB.Where("id = ?", record.ID).First(&retrieved).Error
+	require.NoError(t, err)
+	require.Equal(t, record.ID, retrieved.ID)
+	require.Equal(t, record.Content, retrieved.Content)
+
+	// Since sharding key is "id", use the compiled middleware's config
+	// which has the algorithms set up
+	compiledConfig := testMiddleware.configs["simple_records"]
+	var suffix string
+	if compiledConfig.ShardingAlgorithmByPrimaryKey != nil {
+		suffix = compiledConfig.ShardingAlgorithmByPrimaryKey(record.ID)
+	} else if compiledConfig.ShardingAlgorithm != nil {
+		suffixStr, err := compiledConfig.ShardingAlgorithm(record.ID)
+		require.NoError(t, err)
+		suffix = suffixStr
+	} else {
+		t.Fatal("No sharding algorithm found")
+	}
+	expectedTable := "simple_records" + suffix
+
+	lastQuery := testMiddleware.LastQuery()
+	require.Contains(t, lastQuery, expectedTable, "Query should use the correct sharded table")
 }

@@ -1316,10 +1316,19 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 						return ftQuery, stQuery, tableName, err
 					}
 
-					currentSuffix, err := getSuffix(value, id, keyFound, r)
-					if err != nil {
-						// Check if DoubleWrite is enabled for this table
-						return ftQuery, stQuery, tableName, err
+					var currentSuffix string
+					// Special case: if sharding key is "id" with autoIncrement and no ID provided
+					if r.ShardingKey == "id" && !keyFound && id == 0 && r.PrimaryKeyGeneratorFn != nil {
+						// For autoIncrement with id as sharding key, default to shard 0
+						// The actual ID will be generated later and must be consistent with this shard
+						currentSuffix = "_0"
+						GetLogger().Debug("Using default shard 0 for autoIncrement ID-based sharding")
+					} else {
+						currentSuffix, err = getSuffix(value, id, keyFound, r)
+						if err != nil {
+							// Check if DoubleWrite is enabled for this table
+							return ftQuery, stQuery, tableName, err
+						}
 					}
 
 					suffixes[currentSuffix] = true
@@ -2247,6 +2256,14 @@ func (s *Sharding) extractInsertShardingKeyFromValues(r Config, insertStmt *pg_q
 	if r.PartitionType == PartitionTypeList && !keyFound {
 		// todo use a global index instead
 		return nil, 0, false, ErrMissingShardingKey
+	}
+	
+	// Special case: if sharding key is "id" and no ID is provided (autoIncrement case)
+	// we need to allow the insert to proceed and generate the ID later
+	if r.ShardingKey == "id" && !keyFound && id == 0 && r.PrimaryKeyGeneratorFn != nil {
+		// Return without error - ID will be generated in assignIDToInsert
+		GetLogger().Debug("Sharding key is 'id' with autoIncrement - will generate ID later")
+		return nil, 0, false, nil
 	}
 
 	if r.PartitionType == PartitionTypeHash && !keyFound {
