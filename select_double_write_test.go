@@ -458,6 +458,49 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 		require.Equal(t, "processing", resultBase.Status)
 	})
 
+	t.Run("Insert with ON CONFLICT - No ID in INSERT clause", func(t *testing.T) {
+		// This test verifies that when GORM generates an INSERT without ID but with ON CONFLICT on ID,
+		// the sharding library automatically injects an ID to make it work
+		newImage := &ImageStatus{
+			// ID is NOT set - will be auto-generated and injected
+			Status:      "pending",
+			URL:         "https://example.com/broken-image.jpg",
+			ContentType: "",
+			Width:       0,
+			Height:      0,
+			Frames:      0,
+			Size:        0,
+			CreatedAt:   time.Now(),
+			ErrorMsg:    "Failed to download image",
+		}
+
+		// This will generate: INSERT INTO "images" ("status","url",...) VALUES (...) ON CONFLICT ("id") DO UPDATE ...
+		// The sharding library should inject an ID to make this work
+		err := testDB.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"status", "url", "content_type", "width", "height", "frames", "size", "error_msg",
+			}),
+		}).Create(newImage).Error
+		
+		// Should succeed with auto-generated ID
+		require.NoError(t, err, "Should succeed with auto-injected ID")
+		require.NotZero(t, newImage.ID, "ID should be populated after insert")
+		
+		// Verify the record exists in the correct shard
+		shardID := newImage.ID % 4
+		var resultShard ImageStatus
+		err = testDB.Table(fmt.Sprintf("images_%d", shardID)).Where("id = ?", newImage.ID).First(&resultShard).Error
+		require.NoError(t, err, "Should find record in sharded table")
+		require.Equal(t, "pending", resultShard.Status)
+		
+		// Verify double write to base table
+		var resultBase ImageStatus
+		err = testDB.Table("images").Where("id = ?", newImage.ID).First(&resultBase).Error
+		require.NoError(t, err, "Should find record in base table")
+		require.Equal(t, "pending", resultBase.Status)
+	})
+
 	// Clean up
 	truncateTables(testDB, "images", "images_0", "images_1", "images_2", "images_3")
 }
