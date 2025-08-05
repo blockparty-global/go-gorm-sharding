@@ -1246,9 +1246,36 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 						valuesSelect := selectNode.SelectStmt
 						for _, valuesList := range valuesSelect.ValuesLists {
 							if listNode, ok := valuesList.Node.(*pg_query.Node_List); ok {
-								// Generate a unique ID for this row
-								// We use shard 0 temporarily - will be recalculated after ID is generated
-								generatedID := r.PrimaryKeyGeneratorFn(0)
+								// First, extract the sharding key value to determine the correct suffix
+								value, _, keyFound, err := s.extractInsertShardingKeyFromValues(r, insertStmt, valuesList, args...)
+								if err != nil {
+									// If we can't extract the sharding key, use default suffix
+									GetLogger().Debug("Could not extract sharding key for ID generation: %v", err)
+								}
+								
+								// Determine the suffix based on the sharding key value
+								var shardSuffix string
+								if keyFound && value != nil {
+									shardSuffix, err = r.ShardingAlgorithm(value)
+									if err != nil {
+										// Fall back to suffix 0 if we can't determine the suffix
+										shardSuffix = "0"
+										GetLogger().Debug("Error determining suffix from sharding key, using default: %v", err)
+									}
+								} else {
+									// No sharding key value, use default suffix
+									shardSuffix = "0"
+								}
+								
+								// Convert suffix to index for ID generation
+								shardIndex, err := strconv.ParseInt(shardSuffix, 10, 64)
+								if err != nil {
+									shardIndex = 0
+									GetLogger().Debug("Error parsing suffix to index, using 0: %v", err)
+								}
+								
+								// Generate a unique ID for this row with the correct suffix
+								generatedID := r.PrimaryKeyGeneratorFn(shardIndex)
 								
 								// Add the generated ID to VALUES list
 								// Use string representation for large IDs to avoid int32 overflow
