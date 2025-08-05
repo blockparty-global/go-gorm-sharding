@@ -1199,75 +1199,6 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 		var suffix string
 		if isInsert {
-			// Check if INSERT has ON CONFLICT on ID but no ID column
-			hasOnConflictOnID := false
-			hasIDColumn := false
-			
-			// Check if ID column exists in INSERT
-			for _, colItem := range insertStmt.Cols {
-				if resTarget, ok := colItem.Node.(*pg_query.Node_ResTarget); ok {
-					if strings.ToLower(resTarget.ResTarget.Name) == "id" {
-						hasIDColumn = true
-						break
-					}
-				}
-			}
-			
-			// Check if INSERT has ON CONFLICT on ID
-			if insertStmt.OnConflictClause != nil {
-				if insertStmt.OnConflictClause.Infer != nil {
-					for _, item := range insertStmt.OnConflictClause.Infer.IndexElems {
-						if indexElem, ok := item.Node.(*pg_query.Node_IndexElem); ok {
-							if strings.ToLower(indexElem.IndexElem.Name) == "id" {
-								hasOnConflictOnID = true
-								break
-							}
-						}
-					}
-				}
-			}
-			
-			// If ON CONFLICT is on ID but no ID column, we need to add ID column and generate IDs
-			if hasOnConflictOnID && !hasIDColumn && r.PrimaryKeyGeneratorFn != nil {
-				GetLogger().Debug("ON CONFLICT on ID without ID column - adding ID column and generating IDs")
-				
-				// Add ID column to the INSERT
-				insertStmt.Cols = append(insertStmt.Cols, &pg_query.Node{
-					Node: &pg_query.Node_ResTarget{
-						ResTarget: &pg_query.ResTarget{
-							Name: "id",
-						},
-					},
-				})
-				
-				// Generate and add IDs to each VALUES list
-				if insertStmt.SelectStmt != nil {
-					if selectNode, ok := insertStmt.SelectStmt.Node.(*pg_query.Node_SelectStmt); ok {
-						valuesSelect := selectNode.SelectStmt
-						for _, valuesList := range valuesSelect.ValuesLists {
-							if listNode, ok := valuesList.Node.(*pg_query.Node_List); ok {
-								// Generate a unique ID for this row
-								// We use shard 0 temporarily - will be recalculated after ID is generated
-								generatedID := r.PrimaryKeyGeneratorFn(0)
-								
-								// Add the generated ID to VALUES list
-								// Use string representation for large IDs to avoid int32 overflow
-								listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
-									Node: &pg_query.Node_AConst{
-										AConst: &pg_query.A_Const{
-											Val: &pg_query.A_Const_Sval{
-												Sval: &pg_query.String{Sval: fmt.Sprintf("%d", generatedID)},
-											},
-											Location: -1,
-										},
-									},
-								})
-							}
-						}
-					}
-				}
-			}
-			
 			// Handle insert statements
 			var consistentSuffix string
 			suffixes := make(map[string]bool)
@@ -2013,27 +1944,6 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 			break
 		}
 	}
-	
-	// Check if INSERT has ON CONFLICT on ID column
-	hasOnConflictOnID := false
-	if insertStmt.OnConflictClause != nil {
-		GetLogger().Debug("INSERT has OnConflictClause")
-		if insertStmt.OnConflictClause.Infer != nil {
-			GetLogger().Debug("OnConflictClause has Infer clause with %d elements", len(insertStmt.OnConflictClause.Infer.IndexElems))
-			for _, item := range insertStmt.OnConflictClause.Infer.IndexElems {
-				if indexElem, ok := item.Node.(*pg_query.Node_IndexElem); ok {
-					GetLogger().Debug("Checking conflict column: %s", indexElem.IndexElem.Name)
-					if strings.ToLower(indexElem.IndexElem.Name) == "id" {
-						hasOnConflictOnID = true
-						GetLogger().Debug("Found ON CONFLICT on ID column")
-						break
-					}
-				}
-			}
-		}
-	} else {
-		GetLogger().Debug("INSERT has no OnConflictClause")
-	}
 
 	// Extract shard index from table name
 	shardedTableName := insertStmt.Relation.Relname
@@ -2107,8 +2017,7 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 	} else {
 		// 'id' is not present in insert columns
 		// Only add 'id' if the generator is NOT PKCustom and a generator function exists
-		// (ON CONFLICT on ID is handled earlier in the resolve function)
-		if r.PrimaryKeyGenerator != PKCustom && r.PrimaryKeyGeneratorFn != nil && !hasOnConflictOnID {
+		if r.PrimaryKeyGenerator != PKCustom && r.PrimaryKeyGeneratorFn != nil {
 			// Add the 'id' column definition if it wasn't present
 			log.Println("'id' column not present in insert columns; adding it.")
 			insertStmt.Cols = append(insertStmt.Cols, &pg_query.Node{
@@ -2158,7 +2067,7 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 				})
 			}
 		}
-		// Else, PrimaryKeyGenerator is PKCustom or PrimaryKeyGeneratorFn is nil, and no ON CONFLICT on ID, so we skip adding 'id' column
+		// Else, PrimaryKeyGenerator is PKCustom or PrimaryKeyGeneratorFn is nil, so we skip adding 'id' column
 	}
 
 	return nil

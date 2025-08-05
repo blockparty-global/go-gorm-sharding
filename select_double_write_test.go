@@ -589,13 +589,13 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 		// We can't predict exact distribution due to auto-generated IDs, but
 		// we should have at least some distribution across shards
 		require.GreaterOrEqual(t, shardsUsed, 1, "Records should be distributed across at least 1 shard")
-		
+
 		// Log the actual distribution for debugging
 		t.Logf("Actual shard distribution with auto-generated IDs:")
 		for shard := 0; shard < 4; shard++ {
 			t.Logf("  Shard %d: %d records", shard, shardCounts[shard])
 		}
-		
+
 		// Verify total count
 		totalRecords := 0
 		for _, count := range shardCounts {
