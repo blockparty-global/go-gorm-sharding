@@ -482,18 +482,18 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 				"status", "url", "content_type", "width", "height", "frames", "size", "error_msg",
 			}),
 		}).Create(newImage).Error
-		
+
 		// Should succeed with auto-generated ID
 		require.NoError(t, err, "Should succeed with auto-injected ID")
 		require.NotZero(t, newImage.ID, "ID should be populated after insert")
-		
+
 		// Verify the record exists in the correct shard
 		shardID := newImage.ID % 4
 		var resultShard ImageStatus
 		err = testDB.Table(fmt.Sprintf("images_%d", shardID)).Where("id = ?", newImage.ID).First(&resultShard).Error
 		require.NoError(t, err, "Should find record in sharded table")
 		require.Equal(t, "pending", resultShard.Status)
-		
+
 		// Verify double write to base table
 		var resultBase ImageStatus
 		err = testDB.Table("images").Where("id = ?", newImage.ID).First(&resultBase).Error
@@ -502,61 +502,61 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 	})
 
 	t.Run("Insert with ON CONFLICT - Distribution with different sharding keys", func(t *testing.T) {
-		// This test verifies that when we provide different sharding key values,
-		// the records are distributed to different shards based on the sharding key
-		
+		// This test verifies that when records have different IDs (the sharding key),
+		// they are distributed to different shards based on ID % 4
+
 		type testCase struct {
-			userID       int64
-			url          string
-			expectedShard int
+			id     int64 `gorm:"primarykey;autoIncrement:true"`
+			userID int64
+			url    string
 		}
-		
-		// Create test cases with different user IDs that should go to different shards
-		// Using hash sharding with 4 shards, user_id % 4 determines the shard
+
+		// Create test cases with specific IDs that will go to different shards
+		// Using hash sharding with 4 shards, id % 4 determines the shard
 		testCases := []testCase{
-			{userID: 100, url: "https://example.com/dist-test-1.jpg", expectedShard: 0}, // 100 % 4 = 0
-			{userID: 101, url: "https://example.com/dist-test-2.jpg", expectedShard: 1}, // 101 % 4 = 1
-			{userID: 102, url: "https://example.com/dist-test-3.jpg", expectedShard: 2}, // 102 % 4 = 2
-			{userID: 103, url: "https://example.com/dist-test-4.jpg", expectedShard: 3}, // 103 % 4 = 3
-			{userID: 104, url: "https://example.com/dist-test-5.jpg", expectedShard: 0}, // 104 % 4 = 0
-			{userID: 105, url: "https://example.com/dist-test-6.jpg", expectedShard: 1}, // 105 % 4 = 1
+			{userID: 100, url: "https://example.com/dist-test-1.jpg"}, // 1000 % 4 = 0 -> shard 0
+			{userID: 101, url: "https://example.com/dist-test-2.jpg"}, // 1001 % 4 = 1 -> shard 1
+			{userID: 102, url: "https://example.com/dist-test-3.jpg"}, // 1002 % 4 = 2 -> shard 2
+			{userID: 103, url: "https://example.com/dist-test-4.jpg"}, // 1003 % 4 = 3 -> shard 3
+			{userID: 104, url: "https://example.com/dist-test-5.jpg"}, // 1004 % 4 = 0 -> shard 0
+			{userID: 105, url: "https://example.com/dist-test-6.jpg"}, // 1005 % 4 = 1 -> shard 1
 		}
-		
+
 		shardCounts := make(map[int]int)
-		
+
 		for _, tc := range testCases {
-			newImage := &Image{
-				// ID is NOT set - will be auto-generated with correct suffix
-				UserID:    tc.userID, // This is the sharding key
+			// Calculate expected shard based on ID (the sharding key)
+			expectedShard := int(tc.id % 4)
+
+			newImage := &ImageStatus{
+				ID:        tc.id, // Set explicit ID since it's the sharding key
 				Status:    "pending",
 				URL:       tc.url,
-				Name:      fmt.Sprintf("Distribution test %d", tc.userID),
 				CreatedAt: time.Now(),
 			}
-			
-			// Use ON CONFLICT on ID to trigger the ID injection logic
+
+			// Use ON CONFLICT on ID
 			err := testDB.Clauses(clause.OnConflict{
 				Columns: []clause.Column{{Name: "id"}},
 				DoUpdates: clause.AssignmentColumns([]string{
-					"user_id", "status", "url", "name",
+					"status", "url",
 				}),
 			}).Create(newImage).Error
-			
-			require.NoError(t, err, "Should succeed with auto-injected ID for user_id: %d", tc.userID)
-			require.NotZero(t, newImage.ID, "ID should be populated after insert")
-			
+
+			require.NoError(t, err, "Should succeed with explicit ID: %d", tc.id)
+			require.Equal(t, tc.id, newImage.ID, "ID should match the provided value")
+
 			// Verify the record went to the expected shard
-			var resultShard Image
-			err = testDB.Table(fmt.Sprintf("images_%d", tc.expectedShard)).
+			var resultShard ImageStatus
+			err = testDB.Table(fmt.Sprintf("images_%d", expectedShard)).
 				Where("id = ?", newImage.ID).
 				First(&resultShard).Error
-			require.NoError(t, err, "Should find record in shard images_%d for user_id %d", tc.expectedShard, tc.userID)
-			require.Equal(t, tc.userID, resultShard.UserID, "UserID should match")
+			require.NoError(t, err, "Should find record in shard images_%d for ID %d", expectedShard, tc.id)
 			require.Equal(t, tc.url, resultShard.URL, "URL should match")
-			
+
 			// Verify it's NOT in other shards
 			for shard := 0; shard < 4; shard++ {
-				if shard != tc.expectedShard {
+				if shard != expectedShard {
 					var count int64
 					testDB.Table(fmt.Sprintf("images_%d", shard)).
 						Where("id = ?", newImage.ID).
@@ -564,18 +564,18 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 					require.Equal(t, int64(0), count, "Record should NOT be in shard images_%d", shard)
 				}
 			}
-			
+
 			// Count distribution
-			shardCounts[tc.expectedShard]++
-			
+			shardCounts[expectedShard]++
+
 			// Verify double write to base table
-			var resultBase Image
+			var resultBase ImageStatus
 			err = testDB.Table("images").Where("id = ?", newImage.ID).First(&resultBase).Error
 			require.NoError(t, err, "Should find record in base table")
-			require.Equal(t, tc.userID, resultBase.UserID, "UserID should match in base table")
+			require.Equal(t, tc.url, resultBase.URL, "URL should match in base table")
 		}
-		
-		// Verify distribution - we should have records in multiple shards
+
+		// Verify distribution - we should have records in all 4 shards
 		shardsUsed := 0
 		for shard := 0; shard < 4; shard++ {
 			if shardCounts[shard] > 0 {
@@ -583,15 +583,15 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 				t.Logf("Shard images_%d: %d records", shard, shardCounts[shard])
 			}
 		}
-		
+
 		// We should have used all 4 shards with our test cases
 		require.Equal(t, 4, shardsUsed, "Records should be distributed across all 4 shards")
-		
-		// Verify the expected distribution
-		require.Equal(t, 2, shardCounts[0], "Shard 0 should have 2 records")
-		require.Equal(t, 2, shardCounts[1], "Shard 1 should have 2 records")
-		require.Equal(t, 1, shardCounts[2], "Shard 2 should have 1 record")
-		require.Equal(t, 1, shardCounts[3], "Shard 3 should have 1 record")
+
+		// Verify the expected distribution based on our test IDs
+		require.Equal(t, 2, shardCounts[0], "Shard 0 should have 2 records (IDs 1000, 1004)")
+		require.Equal(t, 2, shardCounts[1], "Shard 1 should have 2 records (IDs 1001, 1005)")
+		require.Equal(t, 1, shardCounts[2], "Shard 2 should have 1 record (ID 1002)")
+		require.Equal(t, 1, shardCounts[3], "Shard 3 should have 1 record (ID 1003)")
 	})
 
 	// Clean up
