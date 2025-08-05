@@ -779,7 +779,6 @@ func TestInsertNoID(t *testing.T) {
 	assert.NoError(t, err, "InsertNoID create failed")
 
 	// Assert the generated query.
-	// Assert the generated query.
 	// With PKCustom returning 0 and the fix applied, the 'id' column should NOT be added.
 	expectedQueryPrefix := `INSERT INTO orders_0 (user_id, product, category_id) VALUES ($1, $2, $3)` // No 'id' column
 	actualQuery := middlewareNoIDTest.LastQuery()
