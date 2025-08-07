@@ -1256,11 +1256,35 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 									},
 								})
 							}
+						} else if r.PrimaryKeyGenerator == PKSnowflake {
+							// For Snowflake IDs, we need to generate the ID first to know which shard
+							// The shard is determined by the node ID embedded in the Snowflake ID
+							generatedID := r.PrimaryKeyGeneratorFn(0)
+							GetLogger().Debug("Pre-generated Snowflake ID %d for sharding", generatedID)
+							
+							// Determine the correct shard based on this ID
+							currentSuffix, err = getSuffix(nil, generatedID, false, r)
+							if err != nil {
+								return ftQuery, stQuery, tableName, err
+							}
+							
+							// Pass this ID to assignIDToInsert
+							if listNode, ok := valuesList.Node.(*pg_query.Node_List); ok {
+								listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
+									Node: &pg_query.Node_AConst{
+										AConst: &pg_query.A_Const{
+											Val: &pg_query.A_Const_Ival{
+												Ival: &pg_query.Integer{Ival: int32(generatedID)},
+											},
+										},
+									},
+								})
+							}
 						} else {
-							// For Snowflake IDs, default to shard 0
+							// For PKCustom or other generators, default to shard 0
 							// The actual ID will be generated later and must be consistent with this shard
 							currentSuffix = "_0"
-							GetLogger().Debug("Using default shard 0 for Snowflake ID-based sharding")
+							GetLogger().Debug("Using default shard 0 for custom ID-based sharding")
 						}
 					} else {
 						currentSuffix, err = getSuffix(value, id, keyFound, r)
@@ -2084,13 +2108,13 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 					return fmt.Errorf("unsupported values list type when assigning id")
 				}
 
-				// Check if an ID was already added (from pre-generation for sequences)
+				// Check if an ID was already added (from pre-generation for sequences or snowflake)
 				// We check if the list already has an extra item compared to columns (minus the id we just added)
 				expectedItems := len(insertStmt.Cols) - 1 // -1 because we just added 'id' column
 				hasPreGeneratedID := len(listNode.List.Items) > expectedItems
 				
 				var uniqueGeneratedID int64
-				if hasPreGeneratedID && (r.PrimaryKeyGenerator == PKPGSequence || r.PrimaryKeyGenerator == PKMySQLSequence) {
+				if hasPreGeneratedID && (r.PrimaryKeyGenerator == PKPGSequence || r.PrimaryKeyGenerator == PKMySQLSequence || r.PrimaryKeyGenerator == PKSnowflake) {
 					// Extract the pre-generated ID from the last item
 					lastItem := listNode.List.Items[len(listNode.List.Items)-1]
 					if constNode, ok := lastItem.Node.(*pg_query.Node_AConst); ok {

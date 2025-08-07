@@ -239,7 +239,7 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 		DoubleWrite:         true,
 		ShardingKey:         "id",
 		NumberOfShards:      4,
-		PrimaryKeyGenerator: PKSnowflake,
+		PrimaryKeyGenerator: PKPGSequence,
 		PartitionType:       PartitionTypeHash,
 	}
 
