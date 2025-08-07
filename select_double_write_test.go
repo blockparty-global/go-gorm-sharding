@@ -210,7 +210,7 @@ func TestSelectDoubleWriteNonIDShardingKey(t *testing.T) {
 
 // ImageStatus represents an image with status tracking
 type ImageStatus struct {
-	ID          int64     `gorm:"primarykey"`
+	ID          int64     `gorm:"column:id;primaryKey;not null;autoIncrement"`
 	Status      string    `gorm:"not null"`
 	URL         string    `gorm:"not null"`
 	ContentType string    `gorm:"column:content_type"`
@@ -239,7 +239,7 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 		DoubleWrite:         true,
 		ShardingKey:         "id",
 		NumberOfShards:      4,
-		PrimaryKeyGenerator: PKPGSequence,
+		PrimaryKeyGenerator: PKSnowflake,
 		PartitionType:       PartitionTypeHash,
 	}
 
