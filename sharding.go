@@ -126,9 +126,9 @@ type Config struct {
 	// ValueConverter converts values before they are used in SQL queries
 	// This is especially useful for handling custom types like UInt256
 	ValueConverter func(value interface{}) (interface{}, error)
-	
+
 	// ShardPercentageThreshold specifies the threshold (0.0-1.0) for using sharded queries vs base table.
-	// When the percentage of shards that would be queried exceeds this threshold, 
+	// When the percentage of shards that would be queried exceeds this threshold,
 	// the query will use the base table instead of creating a UNION across many shards.
 	// Default is 0.7 (70%) - if more than 70% of shards would be queried, use base table.
 	// Set to 1.0 to always use sharding, or 0.0 to always use base table (when DoubleWrite is enabled).
@@ -201,7 +201,7 @@ func (s *Sharding) compile() error {
 		if c.PartitionType == "" {
 			c.PartitionType = PartitionTypeHash
 		}
-		
+
 		// Set default ShardPercentageThreshold if not specified
 		if c.ShardPercentageThreshold == 0 {
 			c.ShardPercentageThreshold = 0.7 // Default to 70%
@@ -775,7 +775,7 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 			var compositeINValues []interface{}
 			var compositeINTable string
 			var compositeINConfig Config
-			
+
 			for _, table := range tables {
 				s.mutex.RLock()
 				cfg, ok := s.configs[table]
@@ -783,7 +783,7 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 				if ok {
 					shardingKey := cfg.ShardingKey
-					
+
 					// First check for composite IN clauses with multiple values
 					for _, condition := range conditions {
 						keyFound, values, _ := extractAllShardingKeysFromCompositeIn(shardingKey, condition, args, nil)
@@ -793,17 +793,17 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 							compositeINValues = values
 							compositeINTable = table
 							compositeINConfig = cfg
-							GetLogger().Debug("Found composite IN clause with %d values for sharding key %s in table %s", 
+							GetLogger().Debug("Found composite IN clause with %d values for sharding key %s in table %s",
 								len(values), shardingKey, table)
 							break
 						}
 					}
-					
+
 					// If we found multiple values, break out of table loop
 					if hasCompositeINWithMultipleValues {
 						break
 					}
-					
+
 					// Otherwise check for single sharding key
 					_, _, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, nil, table)
 					if keyFound {
@@ -827,9 +827,9 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 					}
 					uniqueSuffixes[suffix] = true
 				}
-				
+
 				GetLogger().Debug("Composite IN clause requires %d unique shards: %v", len(uniqueSuffixes), uniqueSuffixes)
-				
+
 				// If only one suffix is needed, proceed normally
 				if len(uniqueSuffixes) == 1 {
 					hasShardingKey = true
@@ -838,55 +838,55 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 					totalShards := float64(compositeINConfig.NumberOfShards)
 					queriedShards := float64(len(uniqueSuffixes))
 					shardPercentage := queriedShards / totalShards
-					
-					GetLogger().Debug("Query would use %.1f%% of shards (%d/%d), threshold is %.1f%%", 
-						shardPercentage*100, len(uniqueSuffixes), compositeINConfig.NumberOfShards, 
+
+					GetLogger().Debug("Query would use %.1f%% of shards (%d/%d), threshold is %.1f%%",
+						shardPercentage*100, len(uniqueSuffixes), compositeINConfig.NumberOfShards,
 						compositeINConfig.ShardPercentageThreshold*100)
-					
+
 					// Check if we should use base table instead based on threshold
 					if shardPercentage > compositeINConfig.ShardPercentageThreshold && compositeINConfig.DoubleWrite {
 						// Use base table when percentage exceeds threshold
-						GetLogger().Debug("Shard percentage %.1f%% exceeds threshold %.1f%%, using base table", 
+						GetLogger().Debug("Shard percentage %.1f%% exceeds threshold %.1f%%, using base table",
 							shardPercentage*100, compositeINConfig.ShardPercentageThreshold*100)
-						
+
 						// Return original query to use base table
 						return query, query, compositeINTable, nil
 					}
-					
+
 					// Otherwise, create UNION query for multiple shards
 					unionQueries := []string{}
-					
+
 					for suffix := range uniqueSuffixes {
 						// Create table map for this suffix
 						suffixTableMap := make(map[string]string)
 						suffixTableMap[compositeINTable] = compositeINTable + suffix
-						
+
 						// Parse the original query
 						parsedCopy, parseErr := pg_query.Parse(query)
 						if parseErr != nil {
 							return ftQuery, stQuery, tableName, fmt.Errorf("error parsing query for UNION conversion: %v", parseErr)
 						}
-						
+
 						if len(parsedCopy.Stmts) == 0 {
 							return ftQuery, stQuery, tableName, fmt.Errorf("no statements found in parsed query")
 						}
-						
+
 						// Replace table names in the parsed query
 						replaceTableNames(parsedCopy.Stmts[0].Stmt, suffixTableMap)
-						
+
 						// Deparse back to SQL
 						deparsedSQL, deparseErr := pg_query.Deparse(&pg_query.ParseResult{Stmts: parsedCopy.Stmts})
 						if deparseErr != nil {
 							return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing query for suffix %s: %v", suffix, deparseErr)
 						}
-						
+
 						unionQueries = append(unionQueries, "("+deparsedSQL+")")
 					}
-					
+
 					// Combine with UNION ALL
 					stQuery = strings.Join(unionQueries, " UNION ALL ")
 					ftQuery = query // Keep original for double write
-					
+
 					GetLogger().Debug("Created UNION query for composite IN across %d shards: %s", len(uniqueSuffixes), stQuery)
 					return ftQuery, stQuery, compositeINTable, nil
 				}
@@ -1223,10 +1223,45 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 					var currentSuffix string
 					// Special case: if sharding key is "id" with autoIncrement and no ID provided
 					if r.ShardingKey == "id" && !keyFound && id == 0 && r.PrimaryKeyGeneratorFn != nil {
-						// For autoIncrement with id as sharding key, default to shard 0
-						// The actual ID will be generated later and must be consistent with this shard
-						currentSuffix = "_0"
-						GetLogger().Debug("Using default shard 0 for autoIncrement ID-based sharding")
+						// For autoIncrement with id as sharding key, we can't determine the shard
+						// until after the ID is generated. For now, use a placeholder approach.
+						// The ID will be generated in assignIDToInsert and we need to ensure
+						// it's compatible with the selected shard.
+
+						// For sequences (PKPGSequence/PKMySQLSequence), we should generate the ID here
+						// and pass it through somehow to avoid generating it twice
+						if r.PrimaryKeyGenerator == PKPGSequence || r.PrimaryKeyGenerator == PKMySQLSequence {
+							// Generate the ID once here
+							generatedID := r.PrimaryKeyGeneratorFn(0)
+							GetLogger().Debug("Pre-generated sequence ID %d for sharding", generatedID)
+
+							// Determine the correct shard based on this ID
+							currentSuffix, err = getSuffix(nil, generatedID, false, r)
+							if err != nil {
+								return ftQuery, stQuery, tableName, err
+							}
+
+							// We need to pass this ID to assignIDToInsert somehow
+							// For now, let's add it to the valuesList as a placeholder
+							// This is a temporary workaround - we'll need a better solution
+							if listNode, ok := valuesList.Node.(*pg_query.Node_List); ok {
+								// Add the generated ID as a special marker that assignIDToInsert can recognize
+								listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
+									Node: &pg_query.Node_AConst{
+										AConst: &pg_query.A_Const{
+											Val: &pg_query.A_Const_Ival{
+												Ival: &pg_query.Integer{Ival: int32(generatedID)},
+											},
+										},
+									},
+								})
+							}
+						} else {
+							// For Snowflake IDs, default to shard 0
+							// The actual ID will be generated later and must be consistent with this shard
+							currentSuffix = "_0"
+							GetLogger().Debug("Using default shard 0 for Snowflake ID-based sharding")
+						}
 					} else {
 						currentSuffix, err = getSuffix(value, id, keyFound, r)
 						if err != nil {
@@ -2049,8 +2084,28 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 					return fmt.Errorf("unsupported values list type when assigning id")
 				}
 
-				// Generate a NEW unique ID for EACH row in the batch
-				uniqueGeneratedID := r.PrimaryKeyGeneratorFn(int64(shardIndex))
+				// Check if an ID was already added (from pre-generation for sequences)
+				// We check if the list already has an extra item compared to columns (minus the id we just added)
+				expectedItems := len(insertStmt.Cols) - 1 // -1 because we just added 'id' column
+				hasPreGeneratedID := len(listNode.List.Items) > expectedItems
+				
+				var uniqueGeneratedID int64
+				if hasPreGeneratedID && (r.PrimaryKeyGenerator == PKPGSequence || r.PrimaryKeyGenerator == PKMySQLSequence) {
+					// Extract the pre-generated ID from the last item
+					lastItem := listNode.List.Items[len(listNode.List.Items)-1]
+					if constNode, ok := lastItem.Node.(*pg_query.Node_AConst); ok {
+						if ival, ok := constNode.AConst.Val.(*pg_query.A_Const_Ival); ok {
+							uniqueGeneratedID = int64(ival.Ival.Ival)
+							// Remove the temporary ID marker
+							listNode.List.Items = listNode.List.Items[:len(listNode.List.Items)-1]
+						}
+					}
+				}
+				
+				// If we didn't find a pre-generated ID, generate one now
+				if uniqueGeneratedID == 0 {
+					uniqueGeneratedID = r.PrimaryKeyGeneratorFn(int64(shardIndex))
+				}
 
 				// Append the unique generated ID to this specific VALUES list
 				// Ensure a distinct A_Const node is created for each row's ID
@@ -2139,7 +2194,7 @@ func (s *Sharding) extractInsertShardingKeyFromValues(r Config, insertStmt *pg_q
 		// todo use a global index instead
 		return nil, 0, false, ErrMissingShardingKey
 	}
-	
+
 	// Special case: if sharding key is "id" and no ID is provided (autoIncrement case)
 	// we need to allow the insert to proceed and generate the ID later
 	if r.ShardingKey == "id" && !keyFound && id == 0 && r.PrimaryKeyGeneratorFn != nil {

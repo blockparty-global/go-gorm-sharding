@@ -239,7 +239,7 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 		DoubleWrite:         true,
 		ShardingKey:         "id",
 		NumberOfShards:      4,
-		PrimaryKeyGenerator: PKSnowflake,
+		PrimaryKeyGenerator: PKPGSequence,
 		PartitionType:       PartitionTypeHash,
 	}
 
@@ -457,7 +457,7 @@ func TestInsertOnConflictWithSharding(t *testing.T) {
 		require.NoError(t, err, "Failed to find record in base table")
 		require.Equal(t, "processing", resultBase.Status)
 	})
-	
+
 	t.Run("Insert with ON CONFLICT - No ID in INSERT clause", func(t *testing.T) {
 		// This test verifies that when GORM generates an INSERT without ID but with ON CONFLICT on ID,
 		// the sharding library automatically injects an ID to make it work
