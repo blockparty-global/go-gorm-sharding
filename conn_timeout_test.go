@@ -2,6 +2,7 @@ package sharding
 
 import (
 	"database/sql"
+	"fmt"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -22,11 +23,16 @@ func TestConfigureDatabaseTimeouts(t *testing.T) {
 			engine: EnginePostgreSQL,
 		},
 	}
+	// Load the actual config to get the timeout value
+	config := GetConfig()
+	expectedIdleTimeout := config.Connection.TransactionTimeout * 1000
+	expectedStmtTimeout := config.Connection.TransactionTimeout * 1000
+	expectedLockTimeout := 10000 // Default lock timeout
 
-	// Set up expectations for the PostgreSQL timeout settings
-	mock.ExpectExec("SET idle_in_transaction_session_timeout = 300000").WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("SET statement_timeout = 300000").WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectExec("SET lock_timeout = 10000").WillReturnResult(sqlmock.NewResult(0, 0))
+	// Set up expectations for the PostgreSQL timeout settings based on config
+	mock.ExpectExec(fmt.Sprintf("SET idle_in_transaction_session_timeout = %d", expectedIdleTimeout)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(fmt.Sprintf("SET statement_timeout = %d", expectedStmtTimeout)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(fmt.Sprintf("SET lock_timeout = %d", expectedLockTimeout)).WillReturnResult(sqlmock.NewResult(0, 0))
 
 	// Call the function with the mock database
 	err = s.ConfigureDatabaseTimeouts(db)
@@ -133,9 +139,12 @@ func TestConfigureDatabaseTimeoutsError(t *testing.T) {
 			engine: EnginePostgreSQL,
 		},
 	}
+	// Load the actual config to get the timeout value
+	config := GetConfig()
+	expectedIdleTimeout := config.Connection.TransactionTimeout * 1000
 
-	// Set up expectations with an error
-	mock.ExpectExec("SET idle_in_transaction_session_timeout = 300000").WillReturnError(sql.ErrConnDone)
+	// Set up expectations with an error, using the actual config value
+	mock.ExpectExec(fmt.Sprintf("SET idle_in_transaction_session_timeout = %d", expectedIdleTimeout)).WillReturnError(sql.ErrConnDone)
 
 	// Call the function with the mock database
 	err = s.ConfigureDatabaseTimeouts(db)

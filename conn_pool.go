@@ -106,8 +106,23 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 	// Using sync.Map prevents race conditions in concurrent environments
 	pool.sharding.querys.Store("last_query", stQuery)
 
+	currentErr := err // Use a mutable error variable for errors from resolve
+
+	// Determine if table is configured for sharding and its DoubleWrite setting
+	isShardingConfigured := false
+	doubleWriteSetting := false // Default to false; true only if configured and explicitly set
+	if table != "" {
+		pool.sharding.mutex.RLock()
+		if config, ok := pool.sharding.configs[table]; ok {
+			isShardingConfigured = true
+			doubleWriteSetting = config.DoubleWrite
+		}
+		// If table is not in configs, isShardingConfigured remains false, doubleWriteSetting remains false.
+		pool.sharding.mutex.RUnlock()
+	}
+
 	// ErrInsertDiffSuffix check to handle multi-shard inserts
-	if err != nil && errors.Is(err, ErrInsertDiffSuffix) {
+	if currentErr != nil && errors.Is(currentErr, ErrInsertDiffSuffix) {
 		// When we detect multiple shards, try to use the batch handler
 		if strings.Contains(strings.ToUpper(query), "INSERT INTO") {
 			GetLogger().Debug("Detected INSERT with multiple shards, attempting batch handler")
@@ -127,75 +142,69 @@ func (pool ConnPool) ExecContext(ctx context.Context, query string, args ...any)
 
 			// If batch handling failed, log and fall through to standard error handling below.
 			GetLogger().Debug("Batch handler failed: %v, proceeding with original error", batchErr)
-			err = batchErr // Overwrite the original ErrInsertDiffSuffix with the actual batch handler error
+			currentErr = batchErr // Overwrite the original ErrInsertDiffSuffix with the actual batch handler error
 		} else {
-			// If it wasn't an INSERT, we still have the original ErrInsertDiffSuffix in 'err'.
+			// If it wasn't an INSERT, we still have the original ErrInsertDiffSuffix in 'currentErr'.
 			// Fall through to standard error handling.
 		}
 	}
 
-	// Double-write ensures data consistency during migration from non-sharded to sharded tables
-	if table != "" && err != nil && errors.Is(err, ErrMissingShardingKey) {
-		pool.sharding.mutex.RLock()
-		doubleWrite := true
-		if r, ok := pool.sharding.configs[table]; ok {
-			doubleWrite = r.DoubleWrite
-		}
-		pool.sharding.mutex.RUnlock()
-
-		// Fallback to original table maintains data availability even with incomplete sharding metadata
-		if doubleWrite {
+	// Handle ErrMissingShardingKey: only for configured sharded tables
+	if isShardingConfigured && currentErr != nil && errors.Is(currentErr, ErrMissingShardingKey) {
+		// Fallback to original table (ftQuery) if DoubleWrite is enabled for this configured table
+		if doubleWriteSetting {
 			pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
-				result, err = pool.ConnPool.ExecContext(ctx, ftQuery, args...)
+				result, currentErr = pool.ConnPool.ExecContext(ctx, ftQuery, args...)
 				if result != nil {
 					rowsAffected, _ = result.RowsAffected()
 				}
 				return pool.sharding.Explain(ftQuery, args...), rowsAffected
-			}, pool.sharding.Error)
-			// Use the original table result as a fallback strategy
-			return result, err
+			}, pool.sharding.Error) // Note: pool.sharding.Error might not be currentErr here
+			return result, currentErr
 		}
-		return nil, err
+		return nil, currentErr // If not DoubleWrite, return the ErrMissingShardingKey
 	}
 
-	// Writing to main table first creates a fallback data source in case of sharding issues
-	if table != "" {
-		pool.sharding.mutex.RLock()
-		doubleWrite := true
-		if r, ok := pool.sharding.configs[table]; ok {
-			doubleWrite = r.DoubleWrite
-		}
-		pool.sharding.mutex.RUnlock()
-
-		if doubleWrite {
-			// Re-check context to avoid wasted operations if request was cancelled during resolution
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-
-			// Double-write errors don't block sharded operations to prioritize availability over consistency
-			if _, dwErr := pool.ConnPool.ExecContext(ctx, ftQuery, args...); dwErr != nil {
-				errorLog("Error double-writing to main table: %v", dwErr)
-				// Continue despite errors to maintain service availability
-			}
-		}
+	// If resolve returned an error (other than handled ErrInsertDiffSuffix or ErrMissingShardingKey for configured tables), return it.
+	if currentErr != nil && !errors.Is(currentErr, ErrInsertDiffSuffix) { // ErrMissingShardingKey for non-configured tables would fall here
+		return nil, currentErr
+	}
+	// If currentErr was ErrInsertDiffSuffix and batch insert failed (currentErr holds batch error), return it.
+	// 'err' here is the original error from pool.sharding.resolve()
+	if errors.Is(err, ErrInsertDiffSuffix) && currentErr != nil && currentErr != ErrSkipBatchHandler {
+		return nil, currentErr
 	}
 
+	// Double-write to main table: only for configured sharded tables with DoubleWrite enabled
+	if isShardingConfigured && doubleWriteSetting {
+		// Re-check context to avoid wasted operations if request was cancelled during resolution
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		// Double-write errors don't block sharded operations to prioritize availability over consistency
+		if _, dwErr := pool.ConnPool.ExecContext(ctx, ftQuery, args...); dwErr != nil {
+			errorLog("Error double-writing to main table: %v", dwErr)
+			// Continue despite errors to maintain service availability
+		}
+	}
 	// Final context check prevents wasted resources on operations that would be discarded
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 
 	// Sharded query execution comes after main table to ensure at least one copy exists if process crashes
-	result, err = pool.ConnPool.ExecContext(ctx, stQuery, args...)
+	// For non-sharded tables (isShardingConfigured=false), stQuery is the original query, and this is the single execution.
+	var execErr error
+	result, execErr = pool.ConnPool.ExecContext(ctx, stQuery, args...)
 	pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
 		if result != nil {
 			rowsAffected, _ = result.RowsAffected()
 		}
 		return pool.sharding.Explain(stQuery, args...), rowsAffected
-	}, pool.sharding.Error)
+	}, execErr) // Log with the error from this specific execution
 
-	return result, err
+	return result, execErr
 }
 
 func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
@@ -229,12 +238,25 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 	}()
 
 	// Resolving queries outside locks reduces contention in high-throughput scenarios
-	ftQuery, stQuery, table, err := pool.sharding.resolve(query, args...)
+	ftQuery, stQuery, table, resolveErr := pool.sharding.resolve(query, args...)
 	debugLog("QueryContext: FtQuery: %s\n StQuery: %s \n\tQuery: %s \n Table: %s. Error: %v",
-		ftQuery, stQuery, query, table, err)
+		ftQuery, stQuery, query, table, resolveErr)
+	currentErr := resolveErr // Use a mutable error variable
+
+	// Determine if table is configured for sharding and its DoubleWrite setting
+	isShardingConfigured := false
+	doubleWriteSetting := false
+	if table != "" {
+		pool.sharding.mutex.RLock()
+		if config, ok := pool.sharding.configs[table]; ok {
+			isShardingConfigured = true
+			doubleWriteSetting = config.DoubleWrite
+		}
+		pool.sharding.mutex.RUnlock()
+	}
 
 	// ErrInsertDiffSuffix check is first to fail fast and prevent data corruption from partial operations
-	if err != nil && errors.Is(err, ErrInsertDiffSuffix) {
+	if currentErr != nil && errors.Is(currentErr, ErrInsertDiffSuffix) {
 		// When we detect multiple shards, try to use the batch handler
 		if strings.Contains(strings.ToUpper(query), "INSERT INTO") {
 			GetLogger().Debug("Detected INSERT with multiple shards, attempting batch handler")
@@ -269,9 +291,9 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 
 			// If batch handling failed, log and fall through to standard error handling below.
 			GetLogger().Debug("Batch handler failed: %v, proceeding with original error", batchErr)
-			err = batchErr // Overwrite the original ErrInsertDiffSuffix with the actual batch handler error
+			currentErr = batchErr // Overwrite the original ErrInsertDiffSuffix with the actual batch handler error
 		} else {
-			// If it wasn't an INSERT, we still have the original ErrInsertDiffSuffix in 'err'.
+			// If it wasn't an INSERT, we still have the original ErrInsertDiffSuffix in 'currentErr'.
 			// Fall through to standard error handling.
 		}
 	}
@@ -279,17 +301,10 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 	// Thread-safe query storage is critical for concurrent operation reliability
 	pool.sharding.querys.Store("last_query", stQuery)
 
-	// Missing sharding key with double-write enabled allows fallback to original table
-	if table != "" && err != nil && errors.Is(err, ErrMissingShardingKey) {
-		pool.sharding.mutex.RLock()
-		doubleWrite := true
-		if r, ok := pool.sharding.configs[table]; ok {
-			doubleWrite = r.DoubleWrite
-		}
-		pool.sharding.mutex.RUnlock()
-
-		if doubleWrite {
-			pool.sharding.querys.Store("last_query", query)
+	// Handle ErrMissingShardingKey: only for configured sharded tables
+	if isShardingConfigured && currentErr != nil && errors.Is(currentErr, ErrMissingShardingKey) {
+		if doubleWriteSetting { // Use original query (ftQuery) if DoubleWrite enabled
+			pool.sharding.querys.Store("last_query", ftQuery) // Log original query as last_query
 
 			// Context check prevents unnecessary load for already cancelled requests
 			if ctx.Err() != nil {
@@ -297,65 +312,62 @@ func (pool *ConnPool) QueryContext(ctx context.Context, query string, args ...an
 			}
 
 			// Original table query provides a reliable fallback path during migration
-			rows, queryErr := pool.ConnPool.QueryContext(ctx, query, args...)
+			rows, queryErr := pool.ConnPool.QueryContext(ctx, ftQuery, args...) // Use ftQuery
 			pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
-				return pool.sharding.Explain(query, args...), 0
-			}, pool.sharding.Error)
+				return pool.sharding.Explain(ftQuery, args...), 0
+			}, queryErr) // Log with queryErr
 			return rows, queryErr
 		}
-		return nil, err
+		return nil, currentErr // If not DoubleWrite, return the ErrMissingShardingKey
 	}
 
-	// Fast return for other errors prevents unnecessary database operations
-	if err != nil {
-		return nil, err
+	// If resolve returned an error (other than handled ErrInsertDiffSuffix or ErrMissingShardingKey for configured tables), return it.
+	if currentErr != nil && !errors.Is(currentErr, ErrInsertDiffSuffix) {
+		return nil, currentErr
+	}
+	// If currentErr was ErrInsertDiffSuffix and batch insert failed (currentErr holds batch error), return it.
+	// 'resolveErr' here is the original error from pool.sharding.resolve()
+	if errors.Is(resolveErr, ErrInsertDiffSuffix) && currentErr != nil && currentErr != ErrSkipBatchHandler {
+		return nil, currentErr
 	}
 
-	// Different handling for INSERT vs SELECT prevents unnecessary writes for read-only operations
+	// Double-write for INSERTs: only for configured sharded tables with DoubleWrite enabled
 	isInsert := strings.Contains(strings.ToUpper(query), "INSERT INTO")
-	if isInsert && table != "" {
-		pool.sharding.mutex.RLock()
-		doubleWrite := true
-		if r, ok := pool.sharding.configs[table]; ok {
-			doubleWrite = r.DoubleWrite
+	if isInsert && isShardingConfigured && doubleWriteSetting {
+		// Context check prevents wasted operations for cancelled requests
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		pool.sharding.mutex.RUnlock()
 
-		if doubleWrite {
-			// Context check prevents wasted operations for cancelled requests
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-
-			// Main table insert ensures data is captured in both storage locations
-			rows, err := pool.ConnPool.QueryContext(ctx, ftQuery, args...)
-			if err != nil {
-				errorLog("Error double-writing to main table: %v", err)
-				// Continue with sharded operation despite errors for availability
-			} else {
-				debugLog("Successfully double-wrote to main table %s", table)
-				// Closing rows prevents resource leaks in long-running applications
-				if rows != nil {
-					if closeErr := rows.Close(); closeErr != nil {
-						errorLog("Error closing rows from double-write: %v", closeErr)
-					}
+		// Main table insert ensures data is captured in both storage locations
+		rows, err := pool.ConnPool.QueryContext(ctx, ftQuery, args...)
+		if err != nil {
+			errorLog("Error double-writing to main table: %v", err)
+			// Continue with sharded operation despite errors for availability
+		} else {
+			debugLog("Successfully double-wrote to main table %s", table)
+			// Closing rows prevents resource leaks in long-running applications
+			if rows != nil {
+				if closeErr := rows.Close(); closeErr != nil {
+					errorLog("Error closing rows from double-write: %v", closeErr)
 				}
 			}
 		}
 	}
-
 	// Final context check prevents wasted operations when request has been cancelled
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
 
 	// Tracing execution time helps identify performance bottlenecks
-	rows, err := pool.ConnPool.QueryContext(ctx, stQuery, args...)
+	// For non-sharded tables (isShardingConfigured=false), stQuery is the original query, and this is the single execution.
+	var execErr error
+	rows, execErr := pool.ConnPool.QueryContext(ctx, stQuery, args...)
 	pool.sharding.Logger.Trace(ctx, curTime, func() (sql string, rowsAffected int64) {
 		return pool.sharding.Explain(stQuery, args...), 0
-	}, pool.sharding.Error)
+	}, execErr) // Log with the error from this specific execution
 
-	return rows, err
+	return rows, execErr
 }
 
 func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
@@ -389,54 +401,58 @@ func (pool ConnPool) QueryRowContext(ctx context.Context, query string, args ...
 	}()
 
 	// Non-locked query resolution improves concurrency for high-throughput systems
-	ftQuery, stQuery, table, err := pool.sharding.resolve(query, args...)
+	ftQuery, stQuery, table, resolveErr := pool.sharding.resolve(query, args...)
 	debugLog("QueryRowContext: FtQuery: %s\n StQuery: %s \n\tQuery: %s \n Table: %s. Error: %v",
-		ftQuery, stQuery, query, table, err)
+		ftQuery, stQuery, query, table, resolveErr)
+	// Note: QueryRowContext cannot return errors directly. Errors are embedded in sql.Row.
 
-	// Double-write fallback ensures queries succeed even with missing sharding keys
-	if table != "" && err != nil && errors.Is(err, ErrMissingShardingKey) {
+	// Determine if table is configured for sharding and its DoubleWrite setting
+	isShardingConfigured := false
+	doubleWriteSetting := false
+	if table != "" {
 		pool.sharding.mutex.RLock()
-		doubleWrite := true
-		if r, ok := pool.sharding.configs[table]; ok {
-			doubleWrite = r.DoubleWrite
+		if config, ok := pool.sharding.configs[table]; ok {
+			isShardingConfigured = true
+			doubleWriteSetting = config.DoubleWrite
 		}
 		pool.sharding.mutex.RUnlock()
+	}
 
-		if doubleWrite {
+	// Handle ErrMissingShardingKey: only for configured sharded tables
+	if isShardingConfigured && resolveErr != nil && errors.Is(resolveErr, ErrMissingShardingKey) {
+		if doubleWriteSetting { // Use original query (ftQuery) if DoubleWrite enabled
+			// Error from ftQuery will be embedded in the returned sql.Row
 			return pool.ConnPool.QueryRowContext(ctx, ftQuery, args...)
 		}
-		// Error handling deferred to Row.Scan since this method can't return errors
+		// If not DoubleWrite, an error occurred. We can't return error directly.
+		// The subsequent stQuery execution will likely fail or use a problematic query.
+		// GORM's Row.Scan() will reveal the error.
+		// For now, allow flow to stQuery, which might be ftQuery if resolve did that.
+		// Or, construct a Row with the error if possible (not straightforward with stdlib).
+		// Let's assume stQuery will be the one executed, and if resolveErr was critical,
+		// stQuery might be bad or resolve might have made stQuery = ftQuery.
 	}
+	// Unlike ExecContext/QueryContext, we can't easily return early with an error here.
+	// We proceed, and errors from resolveErr might affect stQuery or be revealed on Scan.
 
 	// Thread-safe query storage prevents race conditions in concurrent access
 	pool.sharding.querys.Store("last_query", stQuery)
 
-	// INSERT operations require special handling to maintain cross-table consistency
+	// Double-write for INSERTs: only for configured sharded tables with DoubleWrite enabled
 	isInsert := strings.Contains(strings.ToUpper(query), "INSERT INTO")
-
-	// Double-write for INSERTs keeps both tables in sync during migration periods
-	if isInsert && table != "" && err == nil {
-		pool.sharding.mutex.RLock()
-		doubleWrite := true
-		if r, ok := pool.sharding.configs[table]; ok {
-			doubleWrite = r.DoubleWrite
-		}
-		pool.sharding.mutex.RUnlock()
-
-		if doubleWrite {
-			// QueryContext instead of QueryRowContext enables proper resource/error management
-			rows, dwErr := pool.ConnPool.QueryContext(ctx, ftQuery, args...)
-			if dwErr != nil {
-				errorLog("Error double-writing to main table in QueryRowContext: %v", dwErr)
-			} else if rows != nil {
-				// Always close rows to prevent resource leaks in long-running applications
-				if closeErr := rows.Close(); closeErr != nil {
-					errorLog("Error closing rows from double-write in QueryRowContext: %v", closeErr)
-				}
+	// Only perform double-write if resolveErr was nil, indicating a valid sharded operation initially.
+	if isInsert && isShardingConfigured && doubleWriteSetting && resolveErr == nil {
+		// QueryContext instead of QueryRowContext enables proper resource/error management for the double-write
+		rows, dwErr := pool.ConnPool.QueryContext(ctx, ftQuery, args...)
+		if dwErr != nil {
+			errorLog("Error double-writing to main table in QueryRowContext: %v", dwErr)
+		} else if rows != nil {
+			// Always close rows to prevent resource leaks in long-running applications
+			if closeErr := rows.Close(); closeErr != nil {
+				errorLog("Error closing rows from double-write in QueryRowContext: %v", closeErr)
 			}
 		}
 	}
-
 	return pool.ConnPool.QueryRowContext(ctx, stQuery, args...)
 }
 

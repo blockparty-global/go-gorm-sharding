@@ -127,6 +127,13 @@ type Config struct {
 	// This is especially useful for handling custom types like UInt256
 	ValueConverter func(value interface{}) (interface{}, error)
 
+	// ShardPercentageThreshold specifies the threshold (0.0-1.0) for using sharded queries vs base table.
+	// When the percentage of shards that would be queried exceeds this threshold,
+	// the query will use the base table instead of creating a UNION across many shards.
+	// Default is 0.7 (70%) - if more than 70% of shards would be queried, use base table.
+	// Set to 1.0 to always use sharding, or 0.0 to always use base table (when DoubleWrite is enabled).
+	ShardPercentageThreshold float64
+
 	// ListValues maps category values to partition numbers (for list partitioning)
 	// For example: {"ERC20": 0, "ERC721": 1, "ERC1155": 2}
 	ListValues map[string]int
@@ -193,6 +200,11 @@ func (s *Sharding) compile() error {
 		// Set the default partition type if not specified
 		if c.PartitionType == "" {
 			c.PartitionType = PartitionTypeHash
+		}
+
+		// Set default ShardPercentageThreshold if not specified
+		if c.ShardPercentageThreshold == 0 {
+			c.ShardPercentageThreshold = 0.7 // Default to 70%
 		}
 
 		// Validate NumberOfShards for Snowflake
@@ -520,6 +532,234 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 	case *pg_query.Node_SelectStmt:
 		isSelect = true
 		selectStmt = stmtNode.SelectStmt
+
+		// Check if Op is SETOP_UNION. The 'All' field distinguishes UNION from UNION ALL.
+		if selectStmt.Op == pg_query.SetOperation_SETOP_UNION {
+			// This is a UNION query. We need to process each part to find all required shards.
+			allSuffixes := make(map[string]bool)           // Collect unique suffixes determined by keys
+			anyPartHasKeyForTable := make(map[string]bool) // Track if any part provided a key for a table
+
+			// Helper function to process a select statement (part of the UNION)
+			processUnionPart := func(partStmt *pg_query.SelectStmt) error {
+				partTables := collectTablesFromSelect(partStmt)
+				partConditions := collectConditionsFromSelect(partStmt) // Collect conditions including JOINs
+
+				for _, tbl := range partTables {
+					s.mutex.RLock()
+					cfg, ok := s.configs[tbl]
+					s.mutex.RUnlock()
+					if !ok {
+						continue // Skip non-sharded tables in this part
+					}
+
+					// Extract sharding key/ID for this part
+					// Need alias map for this specific part if it uses aliases
+					partAliasMap := make(map[string]string)
+					for _, fromItem := range partStmt.FromClause {
+						if joinExpr, ok := fromItem.Node.(*pg_query.Node_JoinExpr); ok {
+							mergeMaps(partAliasMap, collectAliasesFromJoin(joinExpr.JoinExpr))
+						} else if rangeVar, ok := fromItem.Node.(*pg_query.Node_RangeVar); ok {
+							if rangeVar.RangeVar.Alias != nil {
+								partAliasMap[rangeVar.RangeVar.Alias.Aliasname] = rangeVar.RangeVar.Relname
+							} else {
+								partAliasMap[rangeVar.RangeVar.Relname] = rangeVar.RangeVar.Relname // Map table to itself if no alias
+							}
+						}
+					}
+
+					value, id, keyFound, err := s.extractShardingKeyFromConditions(cfg.ShardingKey, partConditions, args, partAliasMap, tbl)
+					if err != nil && !errors.Is(err, ErrMissingShardingKey) { // Ignore missing key error for now, handle later
+						GetLogger().Info("Error extracting sharding key for table %s in UNION part: %v", tbl, err) // Changed Warn to Info
+						// Decide how to handle errors - maybe skip this part or return error?
+						// For now, let's try to continue if possible, but log it.
+						// If DoubleWrite is enabled, we might proceed with base table.
+						if !(cfg.DoubleWrite && errors.Is(err, ErrMissingShardingKey)) {
+							return fmt.Errorf("error extracting sharding key for table %s in UNION part: %w", tbl, err)
+						}
+						// If DoubleWrite and missing key, immediately add all suffixes for this table
+						if cfg.ShardingSuffixs != nil {
+							GetLogger().Debug("DoubleWrite enabled for table %s and key missing in this part. Adding all suffixes.", tbl)
+							for _, sfx := range cfg.ShardingSuffixs() {
+								allSuffixes[sfx] = true
+							}
+						}
+						continue // Continue to next table in this part
+					}
+
+					if keyFound || id != 0 {
+						// Key was found, determine the specific suffix
+						anyPartHasKeyForTable[tbl] = true // Mark that a key was found for this table
+						suffix, suffixErr := getSuffix(value, id, keyFound, cfg)
+						if suffixErr != nil {
+							// Handle error getting suffix (e.g., invalid value for list partitioning)
+							return fmt.Errorf("error determining suffix for table %s in UNION part: %w", tbl, suffixErr)
+						}
+						// Add only the specific suffix determined by the key
+						allSuffixes[suffix] = true
+					} else if cfg.DoubleWrite {
+						// No key found, but DoubleWrite is enabled. Add all suffixes.
+						GetLogger().Debug("DoubleWrite enabled for table %s in UNION part, no key found. Adding all suffixes.", tbl)
+						if cfg.ShardingSuffixs != nil {
+							for _, sfx := range cfg.ShardingSuffixs() {
+								allSuffixes[sfx] = true
+							}
+						}
+					} else {
+						// No key found and DoubleWrite is not enabled - this is an error
+						return fmt.Errorf("missing sharding key for table %s in UNION part and DoubleWrite not enabled: %w", tbl, ErrMissingShardingKey)
+					}
+				}
+				return nil
+			}
+
+			// Recursively process UNION parts
+			var processNode func(*pg_query.Node) error
+			processNode = func(node *pg_query.Node) error {
+				if node == nil {
+					return nil
+				}
+				if selStmtNode, ok := node.Node.(*pg_query.Node_SelectStmt); ok {
+					subSelectStmt := selStmtNode.SelectStmt
+					if subSelectStmt.Op == pg_query.SetOperation_SETOP_UNION { // Check for UNION op
+						// Nested UNION - Wrap Larg/Rarg back into Node for recursion
+						if subSelectStmt.Larg != nil {
+							largNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: subSelectStmt.Larg}}
+							if err := processNode(largNode); err != nil {
+								return err
+							}
+						}
+						if subSelectStmt.Rarg != nil {
+							rargNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: subSelectStmt.Rarg}}
+							if err := processNode(rargNode); err != nil {
+								return err
+							}
+						}
+					} else {
+						// Base SELECT statement
+						if err := processUnionPart(subSelectStmt); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				// Handle other node types if necessary, e.g., RangeSubselect
+				return fmt.Errorf("unexpected node type in UNION structure: %T", node.Node)
+			}
+
+			// Start processing from the top-level UNION statement
+			if err := processNode(stmt.Stmt); err != nil {
+				return ftQuery, stQuery, tableName, fmt.Errorf("error processing UNION query: %w", err)
+			}
+
+			// Get all base table names involved in the original UNION
+			unionTables := collectAllTablesFromUnion(selectStmt)
+			if len(unionTables) > 0 {
+				// Get the first table name encountered from the map
+				for t := range unionTables {
+					tableName = t
+					break // Only need one for potential config lookup
+				}
+			}
+
+			useBaseNameForTable := make(map[string]bool)
+			allTablesNeedBaseName := true // Assume all need base name initially
+			hasShardedTables := false
+			for tbl := range unionTables {
+				s.mutex.RLock()
+				cfg, ok := s.configs[tbl]
+				s.mutex.RUnlock()
+
+				if ok { // Only consider sharded tables
+					hasShardedTables = true
+					if cfg.DoubleWrite && !anyPartHasKeyForTable[tbl] {
+						// DoubleWrite is true for this table, AND no key was found in any part.
+						// Mark this table to use its base name instead of sharded names.
+						GetLogger().Debug("DoubleWrite enabled for table %s and no key found in any UNION part. Marking to use base table.", tbl)
+						useBaseNameForTable[tbl] = true
+						// Since we are using base name, we don't need specific suffixes for this table.
+						// Remove any suffixes that might have been added by other parts (though unlikely with this logic).
+					} else {
+						// If key was found OR DoubleWrite is false, this table doesn't need base name
+						allTablesNeedBaseName = false
+					}
+				} else {
+					// Non-sharded table involved, so not all tables need base name
+					allTablesNeedBaseName = false
+				}
+			}
+
+			// If all sharded tables involved need the base name, return the original query
+			if hasShardedTables && allTablesNeedBaseName {
+				GetLogger().Debug("All sharded tables in UNION require base name due to DoubleWrite and missing keys. Returning original query.")
+				return query, query, tableName, nil
+			}
+
+			// If no specific suffixes were determined (e.g., only non-sharded tables or error), return original
+			if len(allSuffixes) == 0 {
+				GetLogger().Debug("UNION query does not involve any determinable shards. Proceeding without rewrite.")
+				return query, query, tableName, nil
+			}
+
+			// Create a UNION ALL query targeting each required shard.
+			rewrittenQueries := []string{}
+			originalUnionQuery := query // Keep the original structure
+
+			// If we need to query specific shards (not just base tables)
+			if len(allSuffixes) > 0 {
+				for suffix := range allSuffixes {
+					// Create a temporary map for this specific suffix/base name combination
+					suffixTableMap := make(map[string]string)
+					s.mutex.RLock()
+					for baseTbl := range s.configs { // Iterate over configured tables
+						// Only add tables that were actually present in the original UNION query
+						if _, exists := unionTables[baseTbl]; exists {
+							if useBaseNameForTable[baseTbl] {
+								suffixTableMap[baseTbl] = baseTbl // Use base name
+							} else {
+								suffixTableMap[baseTbl] = baseTbl + suffix // Use sharded name
+							}
+						}
+					}
+					s.mutex.RUnlock()
+
+					// Parse the original UNION query again to get a fresh AST
+					parsedOriginal, parseErr := pg_query.Parse(originalUnionQuery)
+					if parseErr != nil {
+						return ftQuery, stQuery, tableName, fmt.Errorf("error re-parsing original UNION query: %v", parseErr)
+					}
+					if len(parsedOriginal.Stmts) == 0 {
+						return ftQuery, stQuery, tableName, fmt.Errorf("no statements found in re-parsed UNION query")
+					}
+					unionStmtNode := parsedOriginal.Stmts[0]
+
+					// Replace table names in this AST copy with the current suffix/base name
+					replaceTableNames(unionStmtNode.Stmt, suffixTableMap)
+
+					// Deparse this modified AST back to SQL
+					deparsedSQL, deparseErr := pg_query.Deparse(&pg_query.ParseResult{Stmts: []*pg_query.RawStmt{unionStmtNode}})
+					if deparseErr != nil {
+						return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing modified UNION query for suffix %s: %v", suffix, deparseErr)
+					}
+					// Wrap in parentheses for clarity in the final UNION ALL
+					rewrittenQueries = append(rewrittenQueries, "("+deparsedSQL+")")
+				}
+				// Combine the rewritten queries with UNION ALL
+				stQuery = strings.Join(rewrittenQueries, " UNION ALL ")
+			} else {
+				// This case should ideally not be reached if allTablesNeedBaseName was handled correctly
+				// But as a fallback, return the original query if no suffixes were generated.
+				stQuery = originalUnionQuery
+				GetLogger().Debug("No suffixes generated for UNION rewrite, returning original query. This might indicate an issue.")
+
+			}
+
+			ftQuery = query // Keep original query for potential double write? Or should ftQuery also be rewritten? Let's keep original for now.
+
+			GetLogger().Debug("Rewritten UNION query for shards %v: %s", mapsKeys(allSuffixes), stQuery)
+			return ftQuery, stQuery, tableName, nil // Return the rewritten query
+		}
+
+		// Original SELECT logic (if not a UNION)
 		tables = collectTablesFromSelect(selectStmt)
 		if selectStmt.WhereClause != nil {
 			conditions = append(conditions, selectStmt.WhereClause)
@@ -531,6 +771,11 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 		// If this is a SELECT without sharding key conditions
 		if isSelect && len(conditions) > 0 {
 			hasShardingKey := false
+			hasCompositeINWithMultipleValues := false
+			var compositeINValues []interface{}
+			var compositeINTable string
+			var compositeINConfig Config
+
 			for _, table := range tables {
 				s.mutex.RLock()
 				cfg, ok := s.configs[table]
@@ -538,6 +783,28 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 
 				if ok {
 					shardingKey := cfg.ShardingKey
+
+					// First check for composite IN clauses with multiple values
+					for _, condition := range conditions {
+						keyFound, values, _ := extractAllShardingKeysFromCompositeIn(shardingKey, condition, args, nil)
+						if keyFound && len(values) > 1 {
+							// We have a composite IN clause with multiple sharding key values
+							hasCompositeINWithMultipleValues = true
+							compositeINValues = values
+							compositeINTable = table
+							compositeINConfig = cfg
+							GetLogger().Debug("Found composite IN clause with %d values for sharding key %s in table %s",
+								len(values), shardingKey, table)
+							break
+						}
+					}
+
+					// If we found multiple values, break out of table loop
+					if hasCompositeINWithMultipleValues {
+						break
+					}
+
+					// Otherwise check for single sharding key
 					_, _, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, nil, table)
 					if keyFound {
 						hasShardingKey = true
@@ -545,6 +812,83 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 					}
 				} else {
 					return query, query, tableName, nil
+				}
+			}
+
+			// Handle composite IN clause with multiple sharding key values
+			if hasCompositeINWithMultipleValues {
+				// Determine all unique suffixes needed
+				uniqueSuffixes := make(map[string]bool)
+				for _, value := range compositeINValues {
+					suffix, err := getSuffix(value, 0, true, compositeINConfig)
+					if err != nil {
+						GetLogger().Error("Error determining suffix for value %v: %v", value, err)
+						continue
+					}
+					uniqueSuffixes[suffix] = true
+				}
+
+				GetLogger().Debug("Composite IN clause requires %d unique shards: %v", len(uniqueSuffixes), uniqueSuffixes)
+
+				// If only one suffix is needed, proceed normally
+				if len(uniqueSuffixes) == 1 {
+					hasShardingKey = true
+				} else if len(uniqueSuffixes) > 1 {
+					// Calculate the percentage of shards that would be queried
+					totalShards := float64(compositeINConfig.NumberOfShards)
+					queriedShards := float64(len(uniqueSuffixes))
+					shardPercentage := queriedShards / totalShards
+
+					GetLogger().Debug("Query would use %.1f%% of shards (%d/%d), threshold is %.1f%%",
+						shardPercentage*100, len(uniqueSuffixes), compositeINConfig.NumberOfShards,
+						compositeINConfig.ShardPercentageThreshold*100)
+
+					// Check if we should use base table instead based on threshold
+					if shardPercentage > compositeINConfig.ShardPercentageThreshold && compositeINConfig.DoubleWrite {
+						// Use base table when percentage exceeds threshold
+						GetLogger().Debug("Shard percentage %.1f%% exceeds threshold %.1f%%, using base table",
+							shardPercentage*100, compositeINConfig.ShardPercentageThreshold*100)
+
+						// Return original query to use base table
+						return query, query, compositeINTable, nil
+					}
+
+					// Otherwise, create UNION query for multiple shards
+					unionQueries := []string{}
+
+					for suffix := range uniqueSuffixes {
+						// Create table map for this suffix
+						suffixTableMap := make(map[string]string)
+						suffixTableMap[compositeINTable] = compositeINTable + suffix
+
+						// Parse the original query
+						parsedCopy, parseErr := pg_query.Parse(query)
+						if parseErr != nil {
+							return ftQuery, stQuery, tableName, fmt.Errorf("error parsing query for UNION conversion: %v", parseErr)
+						}
+
+						if len(parsedCopy.Stmts) == 0 {
+							return ftQuery, stQuery, tableName, fmt.Errorf("no statements found in parsed query")
+						}
+
+						// Replace table names in the parsed query
+						replaceTableNames(parsedCopy.Stmts[0].Stmt, suffixTableMap)
+
+						// Deparse back to SQL
+						deparsedSQL, deparseErr := pg_query.Deparse(&pg_query.ParseResult{Stmts: parsedCopy.Stmts})
+						if deparseErr != nil {
+							return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing query for suffix %s: %v", suffix, deparseErr)
+						}
+
+						unionQueries = append(unionQueries, "("+deparsedSQL+")")
+					}
+
+					// Combine with UNION ALL
+					stQuery = strings.Join(unionQueries, " UNION ALL ")
+					ftQuery = query // Keep original for double write
+
+					GetLogger().Debug("Created UNION query for composite IN across %d shards: %s", len(uniqueSuffixes), stQuery)
+					return ftQuery, stQuery, compositeINTable, nil
 				}
 			}
 
@@ -621,9 +965,31 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 				}
 
 				if tableName == "" && len(tables) > 0 {
-					tableName = tables[0]
+					tableName = tables[0] // Assign a table name if possible
 				}
-				return ftQuery, stQuery, tableName, ErrMissingShardingKey
+
+				// Check DoubleWrite before returning ErrMissingShardingKey for SELECT
+				canUseBaseTable := false
+				if tableName != "" { // Ensure we have a table name to check config
+					s.mutex.RLock()
+					cfg, ok := s.configs[tableName]
+					s.mutex.RUnlock()
+					if ok && cfg.DoubleWrite {
+						canUseBaseTable = true
+					}
+				}
+
+				if canUseBaseTable {
+					// DoubleWrite enabled, signal to use the base table query (ftQuery)
+					GetLogger().Debug("SELECT without sharding key for table '%s', DoubleWrite enabled. Using base table query.", tableName)
+					// Return the original query (ftQuery) and nil error.
+					// Both ftQuery and stQuery should be the original query in this case.
+					return query, query, tableName, nil
+				} else {
+					// DoubleWrite is false or config not found, return the error
+					GetLogger().Error("SELECT without sharding key for table '%s', DoubleWrite disabled or config missing. Returning error.", tableName)
+					return ftQuery, stQuery, tableName, ErrMissingShardingKey
+				}
 			}
 		}
 
@@ -671,6 +1037,137 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 		*pg_query.Node_GrantStmt:
 		// DDL statements. Bypass sharding.
 		return query, query, tableName, nil
+	case *pg_query.Node_ViewStmt:
+		// Handle CREATE OR REPLACE VIEW statements
+		viewStmt := stmtNode.ViewStmt
+
+		// Extract the query part of the view definition
+		if viewStmt.Query != nil {
+			// Check if the query references any sharded tables
+			if selectStmt, ok := viewStmt.Query.Node.(*pg_query.Node_SelectStmt); ok {
+				// Collect tables from the SELECT statement
+				tables := collectTablesFromSelect(selectStmt.SelectStmt)
+
+				// Check if any of these tables are sharded
+				for _, table := range tables {
+					s.mutex.RLock()
+					cfg, ok := s.configs[table]
+					s.mutex.RUnlock()
+
+					if ok {
+						// This is a sharded table, extract sharding key from conditions
+						if selectStmt.SelectStmt.WhereClause != nil {
+							conditions := []*pg_query.Node{selectStmt.SelectStmt.WhereClause}
+
+							// Extract sharding key value
+							shardingKey := cfg.ShardingKey
+							value, id, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, nil, table)
+
+							if keyFound || id != 0 {
+								// Determine the suffix
+								suffix, err := getSuffix(value, id, keyFound, cfg)
+								if err != nil {
+									return ftQuery, stQuery, tableName, err
+								}
+
+								// Replace the table name in the query with the sharded table name
+								shardedTable := table + suffix
+								tableMap := map[string]string{table: shardedTable}
+
+								// Replace table names in the query part
+								replaceTableNames(viewStmt.Query, tableMap)
+
+								// Deparse the modified AST back to SQL
+								stmts := []*pg_query.RawStmt{stmt}
+								stQuery, err = pg_query.Deparse(&pg_query.ParseResult{Stmts: stmts})
+								if err != nil {
+									return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing modified view query: %v", err)
+								}
+
+								return ftQuery, stQuery, tableName, nil
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// If no sharding key found or no sharded tables, return the original query
+		return query, query, tableName, nil
+	case *pg_query.Node_RefreshMatViewStmt:
+		// Handle REFRESH MATERIALIZED VIEW statements
+		refreshMatViewStmt := stmtNode.RefreshMatViewStmt
+
+		// Extract the relation (view name)
+		if refreshMatViewStmt.Relation != nil {
+			// For REFRESH MATERIALIZED VIEW, we just pass through the statement
+			// as it operates on the view itself, not the underlying tables
+			return query, query, tableName, nil
+		}
+
+		return query, query, tableName, nil
+
+	case *pg_query.Node_CreateTableAsStmt:
+		// Handle CREATE MATERIALIZED VIEW statements
+		createTableAsStmt := stmtNode.CreateTableAsStmt
+
+		// Check if this is a materialized view
+		if createTableAsStmt.Objtype == pg_query.ObjectType_OBJECT_MATVIEW {
+			// Extract the query part of the materialized view definition
+			if createTableAsStmt.Query != nil {
+				// Check if the query references any sharded tables
+				if selectStmt, ok := createTableAsStmt.Query.Node.(*pg_query.Node_SelectStmt); ok {
+					// Collect tables from the SELECT statement
+					tables := collectTablesFromSelect(selectStmt.SelectStmt)
+
+					// Check if any of these tables are sharded
+					for _, table := range tables {
+						s.mutex.RLock()
+						cfg, ok := s.configs[table]
+						s.mutex.RUnlock()
+
+						if ok {
+							// This is a sharded table, extract sharding key from conditions
+							if selectStmt.SelectStmt.WhereClause != nil {
+								conditions := []*pg_query.Node{selectStmt.SelectStmt.WhereClause}
+
+								// Extract sharding key value
+								shardingKey := cfg.ShardingKey
+								value, id, keyFound, _ := s.extractShardingKeyFromConditions(shardingKey, conditions, args, nil, table)
+
+								if keyFound || id != 0 {
+									// Determine the suffix
+									suffix, err := getSuffix(value, id, keyFound, cfg)
+									if err != nil {
+										return ftQuery, stQuery, tableName, err
+									}
+
+									// Replace the table name in the query with the sharded table name
+									shardedTable := table + suffix
+									tableMap := map[string]string{table: shardedTable}
+
+									// Replace table names in the query part
+									replaceTableNames(createTableAsStmt.Query, tableMap)
+
+									// Deparse the modified AST back to SQL
+									stmts := []*pg_query.RawStmt{stmt}
+									stQuery, err = pg_query.Deparse(&pg_query.ParseResult{Stmts: stmts})
+									if err != nil {
+										return ftQuery, stQuery, tableName, fmt.Errorf("error deparsing modified materialized view query: %v", err)
+									}
+
+									GetLogger().Debug("Rewritten materialized view query: %s", stQuery)
+									return ftQuery, stQuery, tableName, nil
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// If no sharding key found or no sharded tables, return the original query
+			return query, query, tableName, nil
+		}
 	default:
 		return ftQuery, stQuery, tableName, fmt.Errorf("unsupported statement type")
 	}
@@ -723,10 +1220,78 @@ func (s *Sharding) resolve(query string, args ...interface{}) (ftQuery, stQuery,
 						return ftQuery, stQuery, tableName, err
 					}
 
-					currentSuffix, err := getSuffix(value, id, keyFound, r)
-					if err != nil {
-						// Check if DoubleWrite is enabled for this table
-						return ftQuery, stQuery, tableName, err
+					var currentSuffix string
+					// Special case: if sharding key is "id" with autoIncrement and no ID provided
+					if r.ShardingKey == "id" && !keyFound && id == 0 && r.PrimaryKeyGeneratorFn != nil {
+						// For autoIncrement with id as sharding key, we can't determine the shard
+						// until after the ID is generated. For now, use a placeholder approach.
+						// The ID will be generated in assignIDToInsert and we need to ensure
+						// it's compatible with the selected shard.
+
+						// For sequences (PKPGSequence/PKMySQLSequence), we should generate the ID here
+						// and pass it through somehow to avoid generating it twice
+						if r.PrimaryKeyGenerator == PKPGSequence || r.PrimaryKeyGenerator == PKMySQLSequence {
+							// Generate the ID once here
+							generatedID := r.PrimaryKeyGeneratorFn(0)
+							GetLogger().Debug("Pre-generated sequence ID %d for sharding", generatedID)
+
+							// Determine the correct shard based on this ID
+							currentSuffix, err = getSuffix(nil, generatedID, false, r)
+							if err != nil {
+								return ftQuery, stQuery, tableName, err
+							}
+
+							// We need to pass this ID to assignIDToInsert somehow
+							// For now, let's add it to the valuesList as a placeholder
+							// This is a temporary workaround - we'll need a better solution
+							if listNode, ok := valuesList.Node.(*pg_query.Node_List); ok {
+								// Add the generated ID as a special marker that assignIDToInsert can recognize
+								listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
+									Node: &pg_query.Node_AConst{
+										AConst: &pg_query.A_Const{
+											Val: &pg_query.A_Const_Ival{
+												Ival: &pg_query.Integer{Ival: int32(generatedID)},
+											},
+										},
+									},
+								})
+							}
+						} else if r.PrimaryKeyGenerator == PKSnowflake {
+							// For Snowflake IDs, we need to generate the ID first to know which shard
+							// The shard is determined by the node ID embedded in the Snowflake ID
+							generatedID := r.PrimaryKeyGeneratorFn(0)
+							GetLogger().Debug("Pre-generated Snowflake ID %d for sharding", generatedID)
+							
+							// Determine the correct shard based on this ID
+							currentSuffix, err = getSuffix(nil, generatedID, false, r)
+							if err != nil {
+								return ftQuery, stQuery, tableName, err
+							}
+							
+							// Pass this ID to assignIDToInsert
+							if listNode, ok := valuesList.Node.(*pg_query.Node_List); ok {
+								listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
+									Node: &pg_query.Node_AConst{
+										AConst: &pg_query.A_Const{
+											Val: &pg_query.A_Const_Ival{
+												Ival: &pg_query.Integer{Ival: int32(generatedID)},
+											},
+										},
+									},
+								})
+							}
+						} else {
+							// For PKCustom or other generators, default to shard 0
+							// The actual ID will be generated later and must be consistent with this shard
+							currentSuffix = "_0"
+							GetLogger().Debug("Using default shard 0 for custom ID-based sharding")
+						}
+					} else {
+						currentSuffix, err = getSuffix(value, id, keyFound, r)
+						if err != nil {
+							// Check if DoubleWrite is enabled for this table
+							return ftQuery, stQuery, tableName, err
+						}
 					}
 
 					suffixes[currentSuffix] = true
@@ -1007,16 +1572,25 @@ func (s *Sharding) extractShardingKeyFromConditions(shardingKey string, conditio
 
 	// If sharding key is not found, attempt to find 'id' for primary key sharding
 	if !keyFound {
-		var idFound bool
-		var idValue interface{}
-
 		// For hash partitioning, we can use the ID, but for list partitioning,
 		// we must have the list key to determine the correct partition
 		if config.PartitionType == PartitionTypeList {
-
 			// todo  use global index instead
 			return nil, 0, false, ErrMissingShardingKey
 		}
+
+		// Check if DoubleWrite is enabled - if so, don't use ID for sharding
+		// when the sharding key is non-ID, instead fall back to double write table
+		if config.DoubleWrite && config.ShardingKey != "id" {
+			// With DoubleWrite enabled and non-ID sharding key,
+			// we should not use ID to determine shard, fall back to base table
+			GetLogger().Debug("DoubleWrite enabled with non-ID sharding key (%s), not using ID for shard determination", config.ShardingKey)
+			return nil, 0, false, ErrMissingShardingKey
+		}
+
+		// Look for 'id' field
+		var idFound bool
+		var idValue interface{}
 
 		for _, condition := range conditions {
 			//GetLogger().Trace("Traversing condition for 'id'")
@@ -1031,9 +1605,54 @@ func (s *Sharding) extractShardingKeyFromConditions(shardingKey string, conditio
 				return nil, 0, false, ErrInvalidID
 			}
 			id = idInt64
+			// Return the ID for sharding
 			return nil, id, true, nil
 		} else {
-			// Neither sharding key nor 'id' found; return error
+			// Neither sharding key nor 'id' found
+			err = ErrMissingShardingKey
+			return nil, 0, false, err
+		}
+	}
+	// If sharding key is not found, attempt to find 'id' for primary key sharding
+	if !keyFound {
+		// For hash partitioning, we can use the ID, but for list partitioning,
+		// we must have the list key to determine the correct partition
+		if config.PartitionType == PartitionTypeList {
+			// todo  use global index instead
+			return nil, 0, false, ErrMissingShardingKey
+		}
+
+		// Look for 'id' field first
+		var idFound bool
+		var idValue interface{}
+
+		for _, condition := range conditions {
+			//GetLogger().Trace("Traversing condition for 'id'")
+			idFound, idValue, err = traverseConditionForKey("id", condition, args, knownKeys, aliasMap)
+			if idFound || err != nil {
+				break
+			}
+		}
+
+		// Check if DoubleWrite is enabled - if so, don't use ID for sharding
+		// when the sharding key is non-ID, instead fall back to double write table
+		if config.DoubleWrite && config.ShardingKey != "id" && idFound {
+			// With DoubleWrite enabled and non-ID sharding key,
+			// we should not use ID to determine shard, fall back to base table
+			GetLogger().Debug("DoubleWrite enabled with non-ID sharding key (%s), not using ID for shard determination", config.ShardingKey)
+			return nil, 0, false, ErrMissingShardingKey
+		}
+
+		if idFound {
+			idInt64, err := toInt64(idValue)
+			if err != nil {
+				return nil, 0, false, ErrInvalidID
+			}
+			id = idInt64
+			// Return the ID for sharding
+			return nil, id, true, nil
+		} else {
+			// Neither sharding key nor 'id' found
 			err = ErrMissingShardingKey
 			return nil, 0, false, err
 		}
@@ -1251,6 +1870,87 @@ func extractShardingKeyFromCompositeIn(shardingKey string, node *pg_query.Node, 
 	return false, nil, nil
 }
 
+// extractAllShardingKeysFromCompositeIn extracts ALL values for the sharding key from a composite IN clause
+func extractAllShardingKeysFromCompositeIn(shardingKey string, node *pg_query.Node, args []interface{}, knownKeys map[string]interface{}) (keyFound bool, values []interface{}, err error) {
+	if node == nil {
+		return false, nil, nil
+	}
+
+	values = []interface{}{}
+
+	switch n := node.Node.(type) {
+	case *pg_query.Node_AExpr:
+		if n.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_IN {
+			// This is an IN expression
+			GetLogger().Debug("Found IN expression for extracting all sharding keys")
+
+			// Check the left side (columns) of the IN expression
+			if row, ok := n.AExpr.Lexpr.Node.(*pg_query.Node_RowExpr); ok {
+				GetLogger().Debug("Found row expression with %d args", len(row.RowExpr.Args))
+
+				// Find the column index for our sharding key
+				shardingKeyIndex := -1
+				for colIndex, colNode := range row.RowExpr.Args {
+					if colRef, ok := colNode.Node.(*pg_query.Node_ColumnRef); ok {
+						colName := extractColumnName(colRef.ColumnRef, nil)
+						GetLogger().Debug("Column at position %d: %s", colIndex, colName)
+
+						if getColumnNameWithoutTable(colName) == shardingKey {
+							shardingKeyIndex = colIndex
+							GetLogger().Debug("Found sharding key %s in composite IN at position %d", shardingKey, colIndex)
+							break
+						}
+					}
+				}
+
+				if shardingKeyIndex >= 0 {
+					// Extract ALL values from the right side at the sharding key position
+					switch rexpr := n.AExpr.Rexpr.Node.(type) {
+					case *pg_query.Node_List:
+						// List of RowExprs or other values
+						GetLogger().Debug("Right side is a list with %d items", len(rexpr.List.Items))
+						for _, item := range rexpr.List.Items {
+							if rowExpr, ok := item.Node.(*pg_query.Node_RowExpr); ok {
+								// Extract the value at the sharding key position
+								if shardingKeyIndex < len(rowExpr.RowExpr.Args) {
+									valueNode := rowExpr.RowExpr.Args[shardingKeyIndex]
+									value, err := extractValueFromExpr(valueNode, args)
+									if err != nil {
+										return false, nil, err
+									}
+									values = append(values, value)
+									GetLogger().Debug("Extracted value %v from tuple", value)
+								}
+							}
+						}
+						if len(values) > 0 {
+							return true, values, nil
+						}
+					case *pg_query.Node_RowExpr:
+						// Single RowExpr
+						GetLogger().Debug("Right side is a single row expression with %d items", len(rexpr.RowExpr.Args))
+						if shardingKeyIndex < len(rexpr.RowExpr.Args) {
+							valueNode := rexpr.RowExpr.Args[shardingKeyIndex]
+							value, err := extractValueFromExpr(valueNode, args)
+							if err != nil {
+								return false, nil, err
+							}
+							values = append(values, value)
+							return true, values, nil
+						}
+					case *pg_query.Node_SubLink:
+						// Subquery - currently not supported
+						GetLogger().Debug("Right side is a subquery (not supported)")
+						return false, nil, fmt.Errorf("subquery in composite IN not supported")
+					}
+				}
+			}
+		}
+	}
+
+	return false, nil, nil
+}
+
 func collectJoinConditions(selectStmt *pg_query.SelectStmt) []*pg_query.Node {
 	var conditions []*pg_query.Node
 	for _, fromItem := range selectStmt.FromClause {
@@ -1375,53 +2075,78 @@ func (s *Sharding) assignIDToInsert(insertStmt *pg_query.InsertStmt, r Config, a
 		}
 	} else {
 		// 'id' is not present in insert columns
-		if r.PrimaryKeyGeneratorFn != nil {
-			generatedID := r.PrimaryKeyGeneratorFn(int64(shardIndex))
-			if generatedID != 0 {
-				// Proceed to add 'id' column and value
-				log.Println("'id' column not present in insert columns; adding it.")
-				insertStmt.Cols = append(insertStmt.Cols, &pg_query.Node{
-					Node: &pg_query.Node_ResTarget{
-						ResTarget: &pg_query.ResTarget{
-							Name: "id",
+		// Only add 'id' if the generator is NOT PKCustom and a generator function exists
+		if r.PrimaryKeyGenerator != PKCustom && r.PrimaryKeyGeneratorFn != nil {
+			// Add the 'id' column definition if it wasn't present
+			log.Println("'id' column not present in insert columns; adding it.")
+			insertStmt.Cols = append(insertStmt.Cols, &pg_query.Node{
+				Node: &pg_query.Node_ResTarget{
+					ResTarget: &pg_query.ResTarget{
+						Name: "id",
+					},
+				},
+			})
+
+			if insertStmt.SelectStmt == nil {
+				return fmt.Errorf("insert statement has no SelectStmt")
+			}
+
+			selectNode, ok := insertStmt.SelectStmt.Node.(*pg_query.Node_SelectStmt)
+			if !ok {
+				return fmt.Errorf("insert statement SelectStmt is not of type SelectStmt")
+			}
+
+			valuesSelect := selectNode.SelectStmt
+			if len(valuesSelect.ValuesLists) == 0 {
+				return fmt.Errorf("insert statement has no VALUES list")
+			}
+
+			// Iterate through each VALUES list to assign a UNIQUE ID
+			for _, valuesList := range valuesSelect.ValuesLists { // Loop starts here
+				listNode, ok := valuesList.Node.(*pg_query.Node_List)
+				if !ok {
+					return fmt.Errorf("unsupported values list type when assigning id")
+				}
+
+				// Check if an ID was already added (from pre-generation for sequences or snowflake)
+				// We check if the list already has an extra item compared to columns (minus the id we just added)
+				expectedItems := len(insertStmt.Cols) - 1 // -1 because we just added 'id' column
+				hasPreGeneratedID := len(listNode.List.Items) > expectedItems
+				
+				var uniqueGeneratedID int64
+				if hasPreGeneratedID && (r.PrimaryKeyGenerator == PKPGSequence || r.PrimaryKeyGenerator == PKMySQLSequence || r.PrimaryKeyGenerator == PKSnowflake) {
+					// Extract the pre-generated ID from the last item
+					lastItem := listNode.List.Items[len(listNode.List.Items)-1]
+					if constNode, ok := lastItem.Node.(*pg_query.Node_AConst); ok {
+						if ival, ok := constNode.AConst.Val.(*pg_query.A_Const_Ival); ok {
+							uniqueGeneratedID = int64(ival.Ival.Ival)
+							// Remove the temporary ID marker
+							listNode.List.Items = listNode.List.Items[:len(listNode.List.Items)-1]
+						}
+					}
+				}
+				
+				// If we didn't find a pre-generated ID, generate one now
+				if uniqueGeneratedID == 0 {
+					uniqueGeneratedID = r.PrimaryKeyGeneratorFn(int64(shardIndex))
+				}
+
+				// Append the unique generated ID to this specific VALUES list
+				// Ensure a distinct A_Const node is created for each row's ID
+				listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
+					Node: &pg_query.Node_AConst{
+						AConst: &pg_query.A_Const{
+							Val: &pg_query.A_Const_Ival{
+								// Create a new Integer struct for each ID
+								Ival: &pg_query.Integer{Ival: int32(uniqueGeneratedID)},
+							},
+							Location: -1, // Force quoting/handling as constant
 						},
 					},
 				})
-
-				if insertStmt.SelectStmt == nil {
-					return fmt.Errorf("insert statement has no SelectStmt")
-				}
-
-				selectNode, ok := insertStmt.SelectStmt.Node.(*pg_query.Node_SelectStmt)
-				if !ok {
-					return fmt.Errorf("insert statement SelectStmt is not of type SelectStmt")
-				}
-
-				valuesSelect := selectNode.SelectStmt
-				if len(valuesSelect.ValuesLists) == 0 {
-					return fmt.Errorf("insert statement has no VALUES list")
-				}
-
-				for _, valuesList := range valuesSelect.ValuesLists {
-					listNode, ok := valuesList.Node.(*pg_query.Node_List)
-					if !ok {
-						return fmt.Errorf("unsupported values list type when assigning id")
-					}
-
-					// Append the generated ID to the VALUES list
-					listNode.List.Items = append(listNode.List.Items, &pg_query.Node{
-						Node: &pg_query.Node_AConst{
-							AConst: &pg_query.A_Const{
-								Val: &pg_query.A_Const_Ival{
-									Ival: &pg_query.Integer{Ival: int32(generatedID)},
-								},
-							},
-						},
-					})
-				}
 			}
-			// Else, generatedID == 0, so we skip adding 'id' column
 		}
+		// Else, PrimaryKeyGenerator is PKCustom or PrimaryKeyGeneratorFn is nil, so we skip adding 'id' column
 	}
 
 	return nil
@@ -1479,7 +2204,8 @@ func (s *Sharding) extractInsertShardingKeyFromValues(r Config, insertStmt *pg_q
 		}
 
 		if strings.ToLower(colName) == "id" {
-			idValue, err := toInt64(exprValue)
+			// Corrected: Convert exprValue, not idValue
+			idValue, err := toInt64(exprValue) // Use exprValue here
 			if err == nil {
 				id = idValue
 			}
@@ -1491,6 +2217,14 @@ func (s *Sharding) extractInsertShardingKeyFromValues(r Config, insertStmt *pg_q
 	if r.PartitionType == PartitionTypeList && !keyFound {
 		// todo use a global index instead
 		return nil, 0, false, ErrMissingShardingKey
+	}
+
+	// Special case: if sharding key is "id" and no ID is provided (autoIncrement case)
+	// we need to allow the insert to proceed and generate the ID later
+	if r.ShardingKey == "id" && !keyFound && id == 0 && r.PrimaryKeyGeneratorFn != nil {
+		// Return without error - ID will be generated in assignIDToInsert
+		GetLogger().Debug("Sharding key is 'id' with autoIncrement - will generate ID later")
+		return nil, 0, false, nil
 	}
 
 	if r.PartitionType == PartitionTypeHash && !keyFound {
@@ -1587,6 +2321,44 @@ func collectTablesFromSelect(selectStmt *pg_query.SelectStmt) []string {
 	return tables
 }
 
+// collectAllTablesFromUnion recursively finds all base table names within a UNION structure
+func collectAllTablesFromUnion(selectStmt *pg_query.SelectStmt) map[string]struct{} {
+	allTables := make(map[string]struct{})
+
+	var collect func(*pg_query.Node)
+	collect = func(node *pg_query.Node) {
+		if node == nil {
+			return
+		}
+		if selStmtNode, ok := node.Node.(*pg_query.Node_SelectStmt); ok {
+			subSelectStmt := selStmtNode.SelectStmt
+			if subSelectStmt.Op == pg_query.SetOperation_SETOP_UNION { // Check for UNION op
+				// Nested UNION - Wrap Larg/Rarg back into Node for recursion
+				if subSelectStmt.Larg != nil {
+					largNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: subSelectStmt.Larg}}
+					collect(largNode)
+				}
+				if subSelectStmt.Rarg != nil {
+					rargNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: subSelectStmt.Rarg}}
+					collect(rargNode)
+				}
+			} else {
+				// Base SELECT statement
+				tables := collectTablesFromSelect(subSelectStmt)
+				for _, tbl := range tables {
+					allTables[tbl] = struct{}{}
+				}
+			}
+		}
+		// Handle other node types like RangeSubselect if necessary
+	}
+
+	// Start collection from the top-level SelectStmt node
+	collect(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt}})
+
+	return allTables
+}
+
 // collectTablesFromJoin extracts table names from JOIN expressions
 func collectTablesFromJoin(joinExpr *pg_query.JoinExpr) []string {
 	var tables []string
@@ -1613,6 +2385,15 @@ func collectTablesFromExpr(expr *pg_query.Node) []string {
 	return nil
 }
 
+// Helper function to get keys from a map[string]bool
+func mapsKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func caseInsensitiveTableLookup(tableMap map[string]string, tableName string) (string, bool) {
 	// Direct lookup first
 	if val, ok := tableMap[tableName]; ok {
@@ -1637,15 +2418,18 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 	switch n := node.Node.(type) {
 	case *pg_query.Node_RangeVar:
 		if n.RangeVar.Schemaname != "" {
-			GetLogger().Debug("Skipping schema-qualified table: %s.%s", n.RangeVar.Schemaname, n.RangeVar.Relname)
-
-			// Do not replace schema-qualified table names
+			// GetLogger().Debug("replaceTableNames: Skipping schema-qualified table: %s.%s", n.RangeVar.Schemaname, n.RangeVar.Relname)
 			return
 		}
+		originalName := n.RangeVar.Relname
+		// GetLogger().Debug("replaceTableNames: Processing RangeVar: '%s', tableMap: %v", originalName, tableMap)
 		// Replace table names in RangeVar nodes
-		if shardedName, exists := caseInsensitiveTableLookup(tableMap, n.RangeVar.Relname); exists {
+		if shardedName, exists := caseInsensitiveTableLookup(tableMap, originalName); exists {
+			// GetLogger().Debug("replaceTableNames: Replacing '%s' with '%s'", originalName, shardedName)
 			n.RangeVar.Relname = shardedName
 			n.RangeVar.Location = -1 // Force quoting
+		} else {
+			// GetLogger().Debug("replaceTableNames: No replacement found for '%s' in map", originalName)
 		}
 
 	case *pg_query.Node_UpdateStmt:
@@ -1711,7 +2495,7 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 			// Check if the first field is a table name
 			if stringNode, ok := fields[0].Node.(*pg_query.Node_String_); ok {
 				originalTableName := stringNode.String_.Sval
-				if newTableName, exists := tableMap[originalTableName]; exists {
+				if newTableName, exists := caseInsensitiveTableLookup(tableMap, originalTableName); exists {
 					// Replace the table name with the sharded name
 					//GetLogger().Debug("Replacing table name '%s' with sharded name '%s' in ColumnRef", originalTableName, newTableName)
 					stringNode.String_.Sval = newTableName
@@ -1741,6 +2525,12 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 		if subselect, ok := n.SubLink.Subselect.Node.(*pg_query.Node_SelectStmt); ok {
 			replaceSelectStmtTableName(subselect.SelectStmt, tableMap)
 		}
+	case *pg_query.Node_NullTest:
+		// Handle IS NULL and IS NOT NULL conditions
+		if n.NullTest.Arg != nil {
+			replaceTableNames(n.NullTest.Arg, tableMap)
+		}
+
 	default:
 		// Recursively process child nodes if any
 		reflectValue := reflect.ValueOf(n)
@@ -1765,8 +2555,22 @@ func replaceTableNames(node *pg_query.Node, tableMap map[string]string) {
 }
 
 func replaceSelectStmtTableName(selectStmt *pg_query.SelectStmt, tableMap map[string]string) {
+	// Handle UNION operations by recursing into Larg and Rarg
+	if selectStmt.Op == pg_query.SetOperation_SETOP_UNION {
+		if selectStmt.Larg != nil {
+			// Wrap Larg back into a Node before calling replaceTableNames
+			largNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt.Larg}}
+			replaceTableNames(largNode, tableMap)
+		}
+		if selectStmt.Rarg != nil {
+			// Wrap Rarg back into a Node before calling replaceTableNames
+			rargNode := &pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: selectStmt.Rarg}}
+			replaceTableNames(rargNode, tableMap)
+		}
+		// Also process other clauses like ORDER BY, LIMIT if they exist on the UNION node itself
+	}
 
-	// Recursively process FROM clause and other relevant clauses
+	// Recursively process FROM clause and other relevant clauses for non-UNION selects or the base parts of UNIONs
 	for _, item := range selectStmt.FromClause {
 		replaceTableNames(item, tableMap)
 	}

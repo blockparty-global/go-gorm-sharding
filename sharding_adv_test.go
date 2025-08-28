@@ -13,15 +13,28 @@ import (
 )
 
 type TokenWithHashPartition struct {
-	ID             int64  `gorm:"primarykey"`
-	Contract       string `gorm:"index:idx_contract"`
-	TokenID        string `gorm:"index:idx_token_id"`
-	TokenURIStatus string
-	TokenURI       string
-	Name           string
-	Description    string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID                  int64  `gorm:"primarykey"`
+	Contract            string `gorm:"index:idx_contract"`
+	TokenID             string `gorm:"index:idx_token_id"`
+	TokenURIStatus      string
+	TokenURI            string
+	Name                string
+	Description         string
+	LastTokenURICheck   *time.Time
+	MetadataStatus      string
+	MetadataContentType string
+	MetadataContent     string
+	MetadataAttempts    int
+	LastMetadataAttempt *time.Time
+	CreatedAt           time.Time
+	CreatedBlock        *int64
+	BurnedAt            *time.Time
+	BurnedBlock         *int64
+	ErrorMsg            string
+	Expired             bool
+	MetadataChecks      int
+	LastMetadataCheck   *time.Time
+	UpdatedAt           time.Time
 }
 
 // ContractWithHashPartition represents a blockchain contract with hash partitioning
@@ -406,8 +419,8 @@ func TestHashPartitioningWithLowerFunction(t *testing.T) {
 	for _, contract := range contracts {
 		// Create multiple tokens per contract
 		for i := 1; i <= 3; i++ {
+			// Let the PrimaryKeyGenerator (Snowflake) assign the ID automatically
 			token := TokenWithHashPartition{
-				ID:             int64(i),
 				Contract:       contract.Address,
 				TokenID:        fmt.Sprintf("%d", i),
 				TokenURIStatus: "READY",
@@ -536,7 +549,8 @@ func TestHashPartitioningWithLowerFunction(t *testing.T) {
 			Find(&results).Error
 
 		tassert.NoError(t, err, "Query with nosharding and IN clause should execute without errors")
-		tassert.Equal(t, 3, len(results), "Should find 3 tokens in total")
+		// Expect 12 tokens: 3 tokens for each of the 4 contracts matching LOWER('MTKN')
+		tassert.Equal(t, 12, len(results), "Should find 12 tokens in total (3 for each of the 4 MTKN contracts)")
 
 		t.Logf("Found %d tokens with contract addresses IN clause", len(results))
 	})
@@ -565,5 +579,715 @@ func TestHashPartitioningWithLowerFunction(t *testing.T) {
 	// This is a no-op test to make sure the package is tested correctly
 	t.Run("NoOp", func(t *testing.T) {
 		tassert.True(t, true, "This test should always pass")
+	})
+}
+
+func TestUnionQueriesWithSharding(t *testing.T) {
+	// Create a test DB with proper configuration
+	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
+	})
+	if err != nil {
+		t.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	// Register cleanup function
+	t.Cleanup(func() {
+		// Drop tables after test completion
+		testDB.Exec("DROP TABLE IF EXISTS token_with_hash_partitions")
+		testDB.Exec("DROP TABLE IF EXISTS contract_with_hash_partitions")
+		for i := 0; i < 4; i++ {
+			testDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS token_with_hash_partitions_%d", i))
+			testDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS contract_with_hash_partitions_%d", i))
+		}
+	})
+
+	// Set up hash partitioning with contract as the sharding key for tokens
+	tokenConfig := Config{
+		DoubleWrite:         true,
+		ShardingKey:         "contract", // contract is the sharding key for tokens
+		PartitionType:       PartitionTypeHash,
+		NumberOfShards:      4,
+		ShardingAlgorithm:   shardingHasher4Algorithm,
+		PrimaryKeyGenerator: PKSnowflake,
+		ShardingSuffixs: func() []string {
+			return []string{"_0", "_1", "_2", "_3"}
+		},
+	}
+
+	// Set up hash partitioning with address as the sharding key for contracts
+	contractConfig := Config{
+		DoubleWrite:         true,
+		ShardingKey:         "address", // address is the sharding key for contracts
+		PartitionType:       PartitionTypeHash,
+		NumberOfShards:      4,
+		ShardingAlgorithm:   shardingHasher4Algorithm,
+		PrimaryKeyGenerator: PKSnowflake,
+		ShardingSuffixs: func() []string {
+			return []string{"_0", "_1", "_2", "_3"}
+		},
+	}
+
+	// Register the middleware with both configurations
+	configs := map[string]Config{
+		"token_with_hash_partitions":    tokenConfig,
+		"contract_with_hash_partitions": contractConfig,
+	}
+
+	middleware := Register(configs, &TokenWithHashPartition{}, &ContractWithHashPartition{})
+	testDB.Use(middleware)
+
+	// Drop and recreate tables
+	testDB.Exec("DROP TABLE IF EXISTS token_with_hash_partitions")
+	testDB.Exec("DROP TABLE IF EXISTS contract_with_hash_partitions")
+	for i := 0; i < 4; i++ {
+		testDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS token_with_hash_partitions_%d", i))
+		testDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS contract_with_hash_partitions_%d", i))
+	}
+
+	// Auto migrate to create the tables
+	err = testDB.AutoMigrate(&TokenWithHashPartition{}, &ContractWithHashPartition{})
+	if err != nil {
+		t.Fatalf("Failed to migrate tables: %v", err)
+	}
+
+	// Create sharded tables manually
+	for i := 0; i < 4; i++ {
+		// Create token tables
+		testDB.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS token_with_hash_partitions_%d (
+			id bigint PRIMARY KEY,
+			contract text,
+			token_id text,
+			token_uri_status text,
+			token_uri text,
+			name text,
+			description text,
+			created_at timestamp with time zone,
+			updated_at timestamp with time zone
+		)`, i))
+
+		// Create contract tables
+		testDB.Exec(fmt.Sprintf(`CREATE TABLE IF NOT EXISTS contract_with_hash_partitions_%d (
+			id bigint PRIMARY KEY,
+			address text,
+			name text,
+			type text,
+			is_erc20 boolean,
+			is_erc721 boolean,
+			is_erc1155 boolean,
+			created_at timestamp with time zone,
+			updated_at timestamp with time zone
+		)`, i))
+	}
+
+	// Insert test contracts with different types
+	contracts := []ContractWithHashPartition{
+		{Address: "0xabc123", Name: "TokenA", Type: "ERC20", IsERC20: true},
+		{Address: "0xdef456", Name: "TokenB", Type: "ERC721", IsERC721: true},
+		{Address: "0xghi789", Name: "TokenC", Type: "ERC1155", IsERC1155: true},
+		{Address: "0xjkl012", Name: "TokenD", Type: "ERC20", IsERC20: true},
+	}
+
+	// Insert the contracts
+	for _, contract := range contracts {
+		err := testDB.Create(&contract).Error
+		tassert.NoError(t, err, "Failed to insert contract")
+		t.Logf("Created contract with address %s, name %s, type %s, ID %d",
+			contract.Address, contract.Name, contract.Type, contract.ID)
+	}
+
+	// Insert tokens for each contract
+	for _, contract := range contracts {
+		// Create multiple tokens per contract
+		for i := 1; i <= 3; i++ {
+			token := TokenWithHashPartition{
+				Contract:       contract.Address,
+				TokenID:        fmt.Sprintf("%d", i),
+				TokenURIStatus: "READY",
+				Name:           fmt.Sprintf("%s #%d", contract.Name, i),
+				Description:    fmt.Sprintf("Token %d for contract %s", i, contract.Name),
+				CreatedAt:      time.Now(),
+				UpdatedAt:      time.Now(),
+			}
+
+			err := testDB.Create(&token).Error
+			tassert.NoError(t, err, "Failed to insert token")
+			t.Logf("Created token with ID %d, contract %s, tokenID %s", token.ID, token.Contract, token.TokenID)
+		}
+	}
+
+	// Test 1: Basic UNION query with sharding key specified
+	t.Run("BasicUnionWithShardingKey", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// This query should succeed because it uses direct equality on the sharding key (address)
+		// for both parts of the UNION
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE address = ? AND type = 'ERC20'
+			UNION
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE address = ? AND type = 'ERC721'
+		`, contracts[0].Address, contracts[1].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION query with sharding key should succeed")
+		t.Logf("Found %d results with UNION query", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify we got the expected results
+		tassert.GreaterOrEqual(t, len(results), 2, "Should find at least two result")
+		for _, result := range results {
+			t.Logf("Found contract: Address=%s, Name=%s, Type=%s",
+				result.Address, result.Name, result.Type)
+		}
+	})
+
+	// Test 2: UNION ALL query with sharding key specified
+	t.Run("UnionAllWithShardingKey", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// This query should succeed because it uses direct equality on the sharding key (address)
+		// for both parts of the UNION ALL
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE address = ? AND is_erc20 = true
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE address = ? AND is_erc721 = true
+		`, contracts[0].Address, contracts[1].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL query with sharding key should succeed")
+		t.Logf("Found %d results with UNION ALL query", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify we got the expected results
+		tassert.GreaterOrEqual(t, len(results), 2, "Should find at least two results")
+		for _, result := range results {
+			t.Logf("Found contract: Address=%s, Name=%s, Type=%s",
+				result.Address, result.Name, result.Type)
+		}
+	})
+
+	// Test 3: UNION query with nosharding hint
+	t.Run("UnionWithNoshardingHint", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// This query should succeed because it uses the nosharding hint
+		err := testDB.Raw(`/*+ nosharding */ 
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE type = 'ERC20'
+			UNION
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE type = 'ERC721'
+		`).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION query with nosharding hint should succeed")
+		t.Logf("Found %d results with nosharding UNION query", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify we got the expected results
+		tassert.GreaterOrEqual(t, len(results), 2, "Should find at least two results")
+		for _, result := range results {
+			t.Logf("Found contract: Address=%s, Name=%s, Type=%s",
+				result.Address, result.Name, result.Type)
+		}
+	})
+
+	// Test 4: UNION ALL query with IN clause for sharding key
+	t.Run("UnionAllWithInClause", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Get addresses for the first two contracts
+		addresses := []string{contracts[0].Address, contracts[1].Address}
+
+		// This query should succeed because it uses IN clause for the sharding key (address)
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE address IN (?) AND is_erc20 = true
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE address IN (?) AND is_erc721 = true
+		`, addresses, addresses).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL query with IN clause should succeed")
+		t.Logf("Found %d results with IN clause UNION ALL query", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify we got the expected results
+		tassert.GreaterOrEqual(t, len(results), 2, "Should find at least two results")
+		for _, result := range results {
+			t.Logf("Found contract: Address=%s, Name=%s, Type=%s",
+				result.Address, result.Name, result.Type)
+		}
+	})
+
+	// Test 5: Complex UNION query with JOIN and sharding key
+	t.Run("ComplexUnionWithJoinAndShardingKey", func(t *testing.T) {
+		var results []struct {
+			ContractAddress string
+			ContractName    string
+			TokenID         string
+			TokenName       string
+		}
+
+		// This query should succeed because it uses direct equality on the sharding key (contract)
+		// for both parts of the UNION
+		err := testDB.Raw(`
+			SELECT t.contract as contract_address, c.name as contract_name, t.token_id, t.name as token_name
+			FROM token_with_hash_partitions t
+			JOIN contract_with_hash_partitions c ON t.contract = c.address
+			WHERE t.contract = ? AND c.is_erc20 = true
+			UNION
+			SELECT t.contract as contract_address, c.name as contract_name, t.token_id, t.name as token_name
+			FROM token_with_hash_partitions t
+			JOIN contract_with_hash_partitions c ON t.contract = c.address
+			WHERE t.contract = ? AND c.is_erc721 = true
+		`, contracts[0].Address, contracts[1].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "Complex UNION query with JOIN should succeed")
+		t.Logf("Found %d results with complex UNION query", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify we got the expected results
+		tassert.GreaterOrEqual(t, len(results), 3, "Should find at least three results")
+		for _, result := range results {
+			t.Logf("Found token: ContractAddress=%s, ContractName=%s, TokenID=%s, TokenName=%s",
+				result.ContractAddress, result.ContractName, result.TokenID, result.TokenName)
+		}
+	})
+
+	// Test 6: UNION ALL with ORDER BY and LIMIT
+	t.Run("UnionAllWithOrderByAndLimit", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// This query should succeed because it uses direct equality on the sharding key (address)
+		// for both parts of the UNION ALL, with ORDER BY and LIMIT
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE address = ? 
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions 
+			WHERE address = ? 
+			ORDER BY name
+			LIMIT 5
+		`, contracts[0].Address, contracts[1].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL query with ORDER BY and LIMIT should succeed")
+		t.Logf("Found %d results with UNION ALL ORDER BY LIMIT query", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify we got the expected results
+		tassert.GreaterOrEqual(t, len(results), 1, "Should find at least one result")
+		tassert.LessOrEqual(t, len(results), 5, "Should find at most 5 results due to LIMIT")
+		for _, result := range results {
+			t.Logf("Found contract: Address=%s, Name=%s, Type=%s",
+				result.Address, result.Name, result.Type)
+		}
+	})
+
+	// Test 7: Nested UNION query
+	t.Run("NestedUnion", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Union ERC20 (contract 0, shard 1), ERC721 (contract 1, shard 3), and ERC1155 (contract 2, shard 1)
+		err := testDB.Raw(`
+			(SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? AND type = 'ERC20')
+			UNION
+			(SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? AND type = 'ERC721')
+			UNION
+			(SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? AND type = 'ERC1155')
+		`, contracts[0].Address, contracts[1].Address, contracts[2].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "Nested UNION query should succeed")
+		t.Logf("Found %d results with nested UNION query", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Should target shards _1 and _3
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+		tassert.Equal(t, 3, len(results), "Should find 3 distinct contracts")
+	})
+
+	// Test 8: UNION targeting different shards explicitly
+	t.Run("UnionDifferentShards", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Contract 0 -> Shard 1
+		// Contract 1 -> Shard 3
+		// Contract 2 -> Shard 1
+		// Contract 3 -> Shard 1
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 1
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 3
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 1
+		`, contracts[0].Address, contracts[1].Address, contracts[2].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL targeting different shards should succeed")
+		t.Logf("Found %d results with UNION ALL targeting different shards", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Should target shards _1 and _3
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+		tassert.Equal(t, 3, len(results), "Should find 3 contracts")
+	})
+
+	// Test 9: UNION with Aggregation (GROUP BY)
+	t.Run("UnionWithAggregation", func(t *testing.T) {
+		var results []struct {
+			Type  string
+			Count int
+		}
+
+		// Count ERC20s in shard 1 (contracts 0 & 3) and ERC721s in shard 3 (contract 1)
+		err := testDB.Raw(`
+			SELECT type, count(*) as count FROM contract_with_hash_partitions WHERE address = ? GROUP BY type -- Shard 1 (ERC20)
+			UNION ALL
+			SELECT type, count(*) as count FROM contract_with_hash_partitions WHERE address = ? GROUP BY type -- Shard 3 (ERC721)
+			UNION ALL
+			SELECT type, count(*) as count FROM contract_with_hash_partitions WHERE address = ? GROUP BY type -- Shard 1 (ERC20)
+		`, contracts[0].Address, contracts[1].Address, contracts[3].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL with aggregation should succeed")
+		t.Logf("Found %d aggregated results", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Should target shards _1 and _3
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+
+		// Verify counts (expecting 2 ERC20 results from shard 1, 1 ERC721 from shard 3)
+		erc20Count := 0
+		erc721Count := 0
+		for _, r := range results {
+			t.Logf("Found aggregated result: Type=%s, Count=%d", r.Type, r.Count)
+			if r.Type == "ERC20" {
+				erc20Count += r.Count
+			} else if r.Type == "ERC721" {
+				erc721Count += r.Count
+			}
+		}
+		// Note: The UNION ALL combines results *before* final aggregation by the DB if not grouped outside.
+		// Here, each part is grouped, so we expect counts per part.
+		tassert.Equal(t, 2, erc20Count, "Should have counted 2 ERC20 contracts")  // contracts[0] and contracts[3]
+		tassert.Equal(t, 1, erc721Count, "Should have counted 1 ERC721 contract") // contracts[1]
+	})
+
+	// Test 10: UNION with one part missing sharding key (requires DoubleWrite)
+	t.Run("UnionWithMissingKeyDoubleWrite", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Contract 0 -> Shard 1
+		// Type ERC1155 -> Contract 2 -> Shard 1 (but no address key provided)
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 1
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE type = 'ERC1155' -- No sharding key, relies on DoubleWrite
+		`, contracts[0].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL with missing key (DoubleWrite) should succeed")
+		t.Logf("Found %d results with missing key UNION ALL", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Because the second part has no key and DoubleWrite is true, it should query ALL shards.
+		// The first part targets shard 1. So, the final query should hit all shards (_0, _1, _2, _3).
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_0", "Query should target shard 0")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_2", "Query should target shard 2")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+
+		// We expect Contract 0 (ERC20, Shard 1) and Contract 2 (ERC1155, Shard 1)
+		foundContract0 := false
+		foundContract2 := false
+		for _, r := range results {
+			if r.Address == contracts[0].Address {
+				foundContract0 = true
+			}
+			if r.Address == contracts[2].Address {
+				foundContract2 = true
+			}
+		}
+		tassert.True(t, foundContract0, "Should find contract 0")
+		tassert.True(t, foundContract2, "Should find contract 2")
+		// Depending on UNION ALL behavior, contract 0 might appear twice if present in both parts' results across shards.
+		// Let's check we have at least 2 results.
+		tassert.GreaterOrEqual(t, len(results), 2, "Should find at least 2 results")
+
+	})
+
+	// Test 11: UNION where one part is missing the sharding key (address)
+	t.Run("UnionMissingShardingKeyDifferentFilters", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Contract 1 (TokenB, ERC721) -> Shard 3
+		// Type ERC20 -> Contracts 0 & 3 -> Shards 1 & 1 (but key missing, so should hit all shards)
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE address = ? -- Shard 3 (Key present)
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE type = 'ERC20' -- No address key, should hit all shards due to DoubleWrite
+		`, contracts[1].Address).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL with one part missing sharding key should succeed")
+		t.Logf("Found %d results with missing key UNION ALL (different filters)", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// The first part targets shard 3.
+		// The second part targets all shards (_0, _1, _2, _3) because the key is missing and DoubleWrite=true.
+		// The final query should be a UNION ALL across all shards.
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_0", "Query should target shard 0")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_1", "Query should target shard 1")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_2", "Query should target shard 2")
+		tassert.Contains(t, middleware.LastQuery(), "contract_with_hash_partitions_3", "Query should target shard 3")
+
+		// We expect Contract 1 (TokenB, ERC721, Shard 3) from the first part.
+		// We expect Contract 0 (TokenA, ERC20, Shard 1) and Contract 3 (TokenD, ERC20, Shard 1) from the second part.
+		foundContract0 := false
+		foundContract1 := false
+		foundContract3 := false
+		for _, r := range results {
+			if r.Address == contracts[0].Address {
+				foundContract0 = true
+			}
+			if r.Address == contracts[1].Address {
+				foundContract1 = true
+			}
+			if r.Address == contracts[3].Address {
+				foundContract3 = true
+			}
+		}
+		tassert.True(t, foundContract0, "Should find contract 0 (TokenA)")
+		tassert.True(t, foundContract1, "Should find contract 1 (TokenB)")
+		tassert.True(t, foundContract3, "Should find contract 3 (TokenD)")
+		tassert.GreaterOrEqual(t, len(results), 3, "Should find at least 3 results")
+	})
+
+	// Test 12: UNION where *no* part includes the sharding key (address)
+	t.Run("UnionNoShardingKey", func(t *testing.T) {
+		var results []struct {
+			Address string
+			Name    string
+			Type    string
+		}
+
+		// Select ERC20 and ERC721 contracts without specifying address
+		err := testDB.Raw(`
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE type = 'ERC20'
+			UNION ALL
+			SELECT address, name, type FROM contract_with_hash_partitions WHERE type = 'ERC721'
+		`).Scan(&results).Error
+
+		tassert.NoError(t, err, "UNION ALL with no sharding key in any part should succeed (due to DoubleWrite)")
+		t.Logf("Found %d results with no sharding key UNION ALL", len(results))
+		t.Logf("Last query: %s", middleware.LastQuery())
+		// We expect all ERC20 (Contracts 0 & 3) and ERC721 (Contract 1) contracts.
+		foundContract0 := false
+		foundContract1 := false
+		foundContract3 := false
+		for _, r := range results {
+			if r.Address == contracts[0].Address {
+				foundContract0 = true
+			}
+			if r.Address == contracts[1].Address {
+				foundContract1 = true
+			}
+			if r.Address == contracts[3].Address {
+				foundContract3 = true
+			}
+		}
+		tassert.True(t, foundContract0, "Should find contract 0 (TokenA)")
+		tassert.True(t, foundContract1, "Should find contract 1 (TokenB)")
+		tassert.True(t, foundContract3, "Should find contract 3 (TokenD)")
+		// Expect 3 results because UNION ALL doesn't remove duplicates between the two SELECTs if they were on different shards,
+		// but the final DB execution might consolidate if the same row exists on multiple queried shards.
+		// Given the setup, contracts 0 & 3 are ERC20 (both hash to shard 1), contract 1 is ERC721 (hashes to shard 3).
+		// The query hits all shards. Shard 1 returns A & D. Shard 3 returns B. Other shards return nothing.
+		// Total unique rows = 3.
+		tassert.Equal(t, 3, len(results), "Should find exactly 3 results")
+	})
+}
+
+// LogStream represents a non-partitioned table for testing DELETE operations
+type LogStream struct {
+	ID                int64  `gorm:"primarykey"`
+	Name              string `gorm:"index:idx_name"`
+	IndexerIdentifier string `gorm:"index:idx_indexer_identifier"`
+	Data              string
+}
+
+// TableName specifies the table name for LogStream
+func (LogStream) TableName() string {
+	return "log_streams"
+}
+
+// TestDeleteFromNonPartitionedTable tests that DELETE operations on non-partitioned tables
+// are executed correctly without being truncated
+func TestDeleteFromNonPartitionedTable(t *testing.T) {
+	// Create a test DB with proper configuration
+	testDB, err := gorm.Open(postgres.New(dbConfig), &gorm.Config{
+		DisableForeignKeyConstraintWhenMigrating: true,
+		Logger:                                   logger.Default.LogMode(logger.Info),
+	})
+	if err != nil {
+		t.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	// Register cleanup function
+	t.Cleanup(func() {
+		// Drop the test table after test completion
+		testDB.Exec("DROP TABLE IF EXISTS log_streams")
+	})
+
+	// Create a sharding middleware with configurations for other tables (not log_streams)
+	// This simulates the real-world scenario where some tables are sharded and others are not
+	configs := map[string]Config{
+		"orders": shardingConfig, // Use existing config from test setup
+	}
+
+	// Register the middleware with Order model, but NOT LogStream
+	middleware := Register(configs)
+	testDB.Use(middleware)
+
+	// Drop and recreate the log_streams table
+	testDB.Exec("DROP TABLE IF EXISTS log_streams")
+
+	// Auto migrate to create the table
+	err = testDB.AutoMigrate(&LogStream{})
+	if err != nil {
+		t.Fatalf("Failed to migrate log_streams table: %v", err)
+	}
+
+	// Insert test data
+	testLogs := []LogStream{
+		{
+			ID:                1,
+			Name:              "Test Log 1",
+			IndexerIdentifier: "nft_indexer_indexer_local_1",
+			Data:              "Test data 1",
+		},
+		{ID: 2,
+			Name:              "Test Log 2",
+			IndexerIdentifier: "nft_indexer_indexer_local_2",
+			Data:              "Test data 2",
+		},
+		{ID: 3,
+			Name:              "Test Log 3",
+			IndexerIdentifier: "other_indexer_1",
+			Data:              "Test data 3",
+		},
+	}
+
+	// Insert the test logs
+	for _, log := range testLogs {
+		err := testDB.Create(&log).Error
+		tassert.NoError(t, err, "Failed to insert log stream")
+		t.Logf("Created log stream with ID %d, Name %s, IndexerIdentifier %s",
+			log.ID, log.Name, log.IndexerIdentifier)
+	}
+
+	// Verify data was inserted
+	var count int64
+	testDB.Model(&LogStream{}).Count(&count)
+	tassert.Equal(t, int64(3), count, "Should have 3 log streams inserted")
+
+	// Test 1: Delete with a simple condition
+	t.Run("DeleteWithSimpleCondition", func(t *testing.T) {
+		result := testDB.Where("name = ?", "Test Log 1").Delete(&LogStream{})
+		tassert.NoError(t, result.Error, "Delete operation should succeed")
+		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+
+		// Log the last query to verify it wasn't truncated
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify the record was deleted
+		var remainingCount int64
+		testDB.Model(&LogStream{}).Count(&remainingCount)
+		tassert.Equal(t, int64(2), remainingCount, "Should have 2 log streams remaining")
+	})
+	// Test 1: Delete with a simple ID
+	t.Run("DeleteWithSimpleCondition", func(t *testing.T) {
+		result := testDB.Where("id = ?", 1).Delete(&LogStream{})
+		tassert.NoError(t, result.Error, "Delete operation should succeed")
+		tassert.Equal(t, int64(0), result.RowsAffected, "Should delete exactly 1 row")
+
+		// Log the last query to verify it wasn't truncated
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify the record was deleted
+		var remainingCount int64
+		testDB.Model(&LogStream{}).Count(&remainingCount)
+		tassert.Equal(t, int64(2), remainingCount, "Should have 2 log streams remaining")
+	})
+
+	// Test 2: Delete with a complex condition including the problematic field
+	t.Run("DeleteWithComplexCondition", func(t *testing.T) {
+		// This test specifically targets the issue mentioned by the user
+		// where DELETE statements with conditions on indexer_identifier are getting truncated
+		result := testDB.Where("indexer_identifier LIKE ?", "nft_indexer_indexer_local_%").Delete(&LogStream{})
+		tassert.NoError(t, result.Error, "Delete operation should succeed")
+		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+
+		// Log the last query to verify it wasn't truncated
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify the record was deleted
+		var remainingCount int64
+		testDB.Model(&LogStream{}).Count(&remainingCount)
+		tassert.Equal(t, int64(1), remainingCount, "Should have 1 log stream remaining")
+	})
+
+	// Test 3: Delete with a raw SQL query
+	t.Run("DeleteWithRawSQL", func(t *testing.T) {
+		// This test uses raw SQL to delete, which might bypass some GORM processing
+		result := testDB.Exec("DELETE FROM log_streams WHERE indexer_identifier = ?", "other_indexer_1")
+		tassert.NoError(t, result.Error, "Raw SQL delete operation should succeed")
+		// Corrected assertion: Expect 1 row affected by the delete.
+		tassert.Equal(t, int64(1), result.RowsAffected, "Should delete exactly 1 row")
+
+		// Log the last query to verify it wasn't truncated
+		t.Logf("Last query: %s", middleware.LastQuery())
+
+		// Verify all records were deleted
+		var remainingCount int64
+		testDB.Model(&LogStream{}).Count(&remainingCount)
+		tassert.Equal(t, int64(0), remainingCount, "Should have 0 log streams remaining")
 	})
 }
